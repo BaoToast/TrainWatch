@@ -18,7 +18,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.1'
+VERSION = '1.0.3'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -84,6 +84,7 @@ class App:
         self.result_dir = ''
         self.run_files, self.run_timing = [], []
         self.run_profile = None
+        self.dirty = False          # 第 2 頁有修改還沒儲存
         self.q = queue.Queue()
         self.cancel_flag = False
         self.worker = None
@@ -741,6 +742,8 @@ class App:
     def start_run(self):
         if self.worker and self.worker.is_alive():
             return
+        if self.dirty and not self.confirm('確認', '第 2 頁的修改還沒儲存，重新判讀後這些修改會遺失。\n\n確定要開始判讀嗎？', ok='開始判讀', warn=True):
+            return
         if not self.files:
             messagebox.showinfo(APP, '請先加入影片。')
             return
@@ -798,7 +801,7 @@ class App:
             evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag)
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
-            core.save_frames_and_clips(evs, prof, out, prog2)
+            core.save_frames_and_clips(evs, prof, out, prog2, files=files)
             export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing)
             export.write_excel(os.path.join(out, '列車通過紀錄.xlsx'), evs, prof, files, timing)
             export.write_csv(os.path.join(out, '列車通過紀錄.csv'), evs)
@@ -827,6 +830,7 @@ class App:
                     self._run_finished()
                     self.pb['value'] = 1000
                     self.events, self.result_dir, self.run_files, self.run_timing, self.run_profile = evs, out, files, timing, prof
+                    self.set_dirty(False)       # 判讀完已自動輸出 Excel
                     nv = sum(1 for e in evs if e['valid'])
                     self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。結果在影片旁的「%s」資料夾。' % (
                         '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
@@ -984,7 +988,12 @@ class App:
             self.show_excluded.set(True)       # 讓剛改的那筆還看得到
         self._refresh_keep(e)
 
+    def set_dirty(self, v):
+        self.dirty = v
+        self.root.title('%s v%s%s' % (APP, VERSION, '　（有修改還沒儲存）' if v else ''))
+
     def _refresh_keep(self, e):
+        self.set_dirty(True)
         core.number_events(self.events)        # 依時間重新排序、編號
         i = next(k for k, x in enumerate(self.events) if x is e)
         self.fill_events()
@@ -1006,9 +1015,12 @@ class App:
         except Exception as ex:
             messagebox.showerror(APP, '儲存失敗：%s' % ex)
             return
+        self.set_dirty(False)
         messagebox.showinfo(APP, '已儲存：\n%s' % os.path.join(self.result_dir, '列車通過紀錄.xlsx'))
 
     def open_results(self):
+        if self.dirty and not self.confirm('確認', '目前的結果有修改還沒儲存，開啟別的結果會放棄這些修改。\n\n確定要繼續嗎？', ok='確定', warn=True):
+            return
         p = filedialog.askopenfilename(title='選擇結果資料夾裡的 results.json', filetypes=[('判讀結果', 'results.json'), ('JSON', '*.json')])
         if not p:
             return
@@ -1019,12 +1031,56 @@ class App:
             return
         self.events, self.run_profile, self.run_files, self.run_timing = evs, prof, files, timing
         self.result_dir = os.path.dirname(p)
+        self.set_dirty(False)
         self.fill_events()
 
+    def confirm(self, title, msg, ok='確定', cancel='取消', warn=False):
+        """自訂確認視窗（按鈕文字固定是中文，不受作業系統語言影響）。確定→True，取消／關掉視窗→False"""
+        w = tk.Toplevel(self.root)
+        w.title(title)
+        w.transient(self.root)
+        w.resizable(False, False)
+        res = {'v': False}
+        body = ttk.Frame(w, padding=(18, 16, 18, 8)); body.pack(fill='both')
+        tk.Label(body, text='⚠' if warn else '？', fg='#c05000' if warn else '#1060c0',
+                 font=(self.font_family, 22, 'bold')).pack(side='left', anchor='n', padx=(0, 12))
+        ttk.Label(body, text=msg, justify='left', wraplength=440).pack(side='left', fill='x')
+        bar = ttk.Frame(w, padding=(18, 4, 18, 14)); bar.pack(fill='x')
+
+        def done(v):
+            res['v'] = v
+            w.destroy()
+        b_cancel = ttk.Button(bar, text=cancel, width=10, command=lambda: done(False))
+        b_cancel.pack(side='right')
+        b_ok = ttk.Button(bar, text=ok, width=10, command=lambda: done(True))
+        b_ok.pack(side='right', padx=(0, 8))
+        w.protocol('WM_DELETE_WINDOW', lambda: done(False))
+        w.bind('<Escape>', lambda e: done(False))
+        w.update_idletasks()
+        x = self.root.winfo_rootx() + (self.root.winfo_width() - w.winfo_width()) // 2
+        y = self.root.winfo_rooty() + (self.root.winfo_height() - w.winfo_height()) // 3
+        w.geometry('+%d+%d' % (max(0, x), max(0, y)))
+        (b_cancel if warn else b_ok).focus_set()      # 有未儲存的修改時，預設按鈕是「取消」
+        w.grab_set()
+        self.root.wait_window(w)
+        return res['v']
+
     def on_close(self):
+        """關閉前一律確認：確定＝關閉，取消＝不關閉"""
         if self.worker and self.worker.is_alive():
-            if not messagebox.askyesno(APP, '判讀還在進行，確定要關閉嗎？'):
-                return
+            msg = '判讀還在進行，關閉後這次判讀不會有結果。\n\n確定要關閉嗎？'
+        elif self.dirty:
+            msg = ('第 2 頁的修改還沒儲存（還沒按「儲存修改並重新輸出 Excel」），關閉後這些修改會遺失。\n\n'
+                   '要保留修改，請按「取消」，再按「儲存修改並重新輸出 Excel」。\n\n確定要關閉嗎？')
+        elif self.result_dir:
+            msg = ('判讀結果已經存在：\n%s\n\n下次可以按第 2 頁的「開啟先前的結果…」，選這個資料夾裡的 results.json 打開。\n\n'
+                   '確定要關閉嗎？' % self.result_dir)
+        else:
+            msg = '確定要關閉程式嗎？'
+        warn = bool(self.dirty or (self.worker and self.worker.is_alive()))
+        if not self.confirm('確認關閉', msg, ok='確定關閉', cancel='取消', warn=warn):
+            return
+        if self.worker and self.worker.is_alive():
             self.cancel_flag = True
         self.root.destroy()
 

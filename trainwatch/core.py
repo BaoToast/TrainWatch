@@ -445,38 +445,121 @@ def initial_background(path, crop, seconds=90.0, n=31):
 
 
 # ---------------------------------------------------------------- 截圖與短片
-def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None, cancel=None):
-    """每筆事件存開始／中間／結束截圖，並（可選）擷取前後幾秒的短片"""
+# 注意：有些攝影機實際每秒格數和檔頭寫的不同（例：檔頭 15、實際 10）。這種檔案 OpenCV 的「跳到某秒」會跳錯
+# （實測跳 100 秒落在 246 秒），跳到後段甚至讀不到畫面。所以截圖與短片一律「每支影片從頭依序讀一次」，
+# 用每一格實際的時間決定要不要存，不使用跳轉。
+
+def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None, cancel=None, files=None):
+    """每筆事件存車頭／中間／車尾截圖，並（可選）擷取前後幾秒的短片。
+    files：影片處理順序（跨兩支影片的短片要依序接起來）；沒給就依事件出現的順序。"""
     shot_dir = os.path.join(out_dir, '截圖'); os.makedirs(shot_dir, exist_ok=True)
     clip_dir = os.path.join(out_dir, '短片')
     if profile.make_clips:
         os.makedirs(clip_dir, exist_ok=True)
-    for i, ev in enumerate(events):
-        tag = '%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no']
-        ev['shots'] = []
+    order = list(files or [])
+    for ev in events:
+        for f in (ev['start_file'], ev['end_file']):
+            if f not in order:
+                order.append(f)
+    shots = {f: [] for f in order}       # 檔案 → [(秒數, 事件, 標籤)]
+    clips = {f: [] for f in order}       # 檔案 → [(開始秒, 結束秒, 事件, 第幾段)]
+    last_file = {}                       # 事件 id → 短片最後一段所在的檔案
+    for ev in events:
+        ev['tag'] = '%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no']
+        ev['shots'], ev['clip'] = [], ''
         same = ev['start_file'] == ev['end_file']
-        spots = (('1車頭', ev['start_file'], ev['start_pos']),
-                 ('2中間', ev['start_file'], (ev['start_pos'] + ev['end_pos']) / 2 if same else ev['start_pos'] + 1.0),
-                 ('3車尾', ev['end_file'], ev['end_pos']))
-        for lab, f, pos in spots:
-            fr, _p = read_frame_at(f, pos)
-            if fr is None:
-                continue
-            name = '%s_%s.jpg' % (tag, lab)
-            imwrite(os.path.join(shot_dir, name), draw_overlay(fr, profile))
-            ev['shots'].append(name)
-        ev['clip'] = ''
+        mid = (ev['start_pos'] + ev['end_pos']) / 2 if same else ev['start_pos'] + 1.0
+        shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭'))
+        shots[ev['start_file']].append((mid, ev, '2中間'))
+        shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾'))
         if profile.make_clips:
-            name = '%s.mp4' % tag
-            try:
-                write_clip(ev, profile, os.path.join(clip_dir, name))
-                ev['clip'] = name
-            except Exception as e:  # 短片失敗不影響其他結果
-                ev['reason'] = (ev.get('reason', '') + '；短片產生失敗：' + str(e)).strip('；')
-        if progress:
-            progress((i + 1) / max(1, len(events)), '產生截圖與短片 %d/%d' % (i + 1, len(events)))
+            if same:
+                clips[ev['start_file']].append((max(0.0, ev['start_pos'] - profile.clip_before), ev['end_pos'] + profile.clip_after, ev, 0))
+            else:
+                clips[ev['start_file']].append((max(0.0, ev['start_pos'] - profile.clip_before), 1e9, ev, 0))
+                clips[ev['end_file']].append((0.0, ev['end_pos'] + profile.clip_after, ev, 1))
+            last_file[id(ev)] = ev['end_file']
+    writers = {}                          # 事件 id → 短片寫入狀態
+    todo = [f for f in order if shots[f] or clips[f]]
+    for k, f in enumerate(todo):
         if cancel and cancel():
             break
+        _one_pass(f, sorted(shots[f], key=lambda x: x[0]), clips[f], profile, shot_dir, clip_dir, writers)
+        for ev_id in [e for e, lf in last_file.items() if lf == f and e in writers]:
+            _close_clip(writers.pop(ev_id), clip_dir)
+        if progress:
+            progress((k + 1) / max(1, len(todo)), '產生截圖與短片 %d/%d' % (k + 1, len(todo)))
+    for w in list(writers.values()):      # 取消時收尾
+        _close_clip(w, clip_dir)
+    for ev in events:
+        ev['shots'].sort()
+        ev.pop('tag', None)
+
+
+def _one_pass(path, shot_reqs, clip_reqs, profile, shot_dir, clip_dir, writers):
+    OUT_FPS = 15.0
+    need_until = max([p for p, _e, _l in shot_reqs] + [b for _a, b, _e, _s in clip_reqs] + [0.0])
+    cap = cv2.VideoCapture(path)
+    si = 0
+    last = None                           # 上一格（截圖的位置剛好在影片最後時用）
+    try:
+        while True:
+            if not cap.grab():
+                break
+            pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            want_shot = si < len(shot_reqs) and pos >= shot_reqs[si][0] - 1e-3
+            active = [c for c in clip_reqs if c[0] - 1e-3 <= pos <= c[1]]
+            if not want_shot and not active:
+                if pos > need_until:
+                    break
+                continue
+            ok, fr = cap.retrieve()
+            if not ok:
+                continue
+            img = draw_overlay(fr, profile)
+            last = img
+            while si < len(shot_reqs) and pos >= shot_reqs[si][0] - 1e-3:
+                _p, ev, lab = shot_reqs[si]
+                name = '%s_%s.jpg' % (ev['tag'], lab)
+                imwrite(os.path.join(shot_dir, name), img)
+                ev['shots'].append(name)
+                si += 1
+            for a, b, ev, seg in active:
+                w = writers.get(id(ev))
+                if w is None:
+                    h, wd = img.shape[:2]
+                    tmp = os.path.join(clip_dir, '_tmp_%s.mp4' % ev['tag'])
+                    vw = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*'mp4v'), OUT_FPS, (wd, h))
+                    w = writers[id(ev)] = dict(vw=vw, tmp=tmp, ev=ev, t_out=0.0, seg=None, t0=0.0, base=0.0)
+                if w['seg'] != (path, seg):          # 新的一段（跨檔案時接在後面）
+                    w['seg'], w['t0'], w['base'] = (path, seg), pos, w['t_out']
+                target = w['base'] + (pos - w['t0'])
+                while w['t_out'] <= target + 1e-6:  # 依實際時間補格／跳格，播放速度才正確
+                    w['vw'].write(img)
+                    w['t_out'] += 1.0 / OUT_FPS
+    finally:
+        cap.release()
+    while si < len(shot_reqs) and last is not None:  # 要的位置超過影片最後一格：用最後一格
+        _p, ev, lab = shot_reqs[si]
+        name = '%s_%s.jpg' % (ev['tag'], lab)
+        imwrite(os.path.join(shot_dir, name), last)
+        ev['shots'].append(name)
+        si += 1
+
+
+def _close_clip(w, clip_dir):
+    ev = w['ev']
+    try:
+        w['vw'].release()
+        name = '%s.mp4' % ev['tag']
+        dst = os.path.join(clip_dir, name)
+        if os.path.exists(w['tmp']) and os.path.getsize(w['tmp']) > 0:
+            if os.path.exists(dst):
+                os.remove(dst)
+            os.replace(w['tmp'], dst)        # VideoWriter 不支援中文路徑 → 先寫英文暫存檔名再改名
+            ev['clip'] = name
+    except Exception as e:  # 短片失敗不影響其他結果
+        ev['reason'] = (ev.get('reason', '') + '；短片產生失敗：' + str(e)).strip('；')
 
 
 def imwrite(path, img):
@@ -487,81 +570,44 @@ def imwrite(path, img):
             fh.write(buf.tobytes())
 
 
-def write_clip(ev, profile: Profile, path):
-    segs = []
-    if ev['start_file'] == ev['end_file']:
-        segs.append((ev['start_file'], max(0.0, ev['start_pos'] - profile.clip_before), ev['end_pos'] + profile.clip_after))
-    else:   # 跨兩個檔案
-        segs.append((ev['start_file'], max(0.0, ev['start_pos'] - profile.clip_before), 1e9))
-        segs.append((ev['end_file'], 0.0, ev['end_pos'] + profile.clip_after))
-    # VideoWriter 也不支援中文路徑 → 先寫到暫存英文檔名再搬
-    tmp = os.path.join(os.path.dirname(path), '_tmp_clip.mp4')
-    OUT_FPS = 15.0
-    wr = None
-    t_out = 0.0          # 已輸出的長度（秒）。依影片實際時間補格／跳格，播放速度才會正確
-    try:
-        for f, a, b in segs:
-            cap = cv2.VideoCapture(f)
-            seek_to(cap, a)
-            t0 = None
-            while True:
-                ok, fr = cap.read()
-                if not ok:
-                    break
-                pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-                if pos < a:
-                    continue
-                if pos > b:
-                    break
-                if t0 is None:
-                    t0 = pos - 1e-6
-                    seg_base = t_out
-                img = draw_overlay(fr, profile)
-                if wr is None:
-                    h, w = fr.shape[:2]
-                    wr = cv2.VideoWriter(tmp, cv2.VideoWriter_fourcc(*'mp4v'), OUT_FPS, (w, h))
-                target = seg_base + (pos - t0)
-                while t_out <= target:
-                    wr.write(img)
-                    t_out += 1.0 / OUT_FPS
+_BAD_SEEK = set()
+
+
+def open_at(path, t, near=3.0):
+    """開啟影片並停在 t 秒之前不遠（下一次 read() 讀到的畫面 ≤ t）。
+    先試一次跳轉，讀一格檢查實際時間；跳錯（每秒格數和檔頭不符的影片）就從頭依序讀過去。"""
+    cap = cv2.VideoCapture(path)
+    if t > near:
+        if path not in _BAD_SEEK:
+            cap.set(cv2.CAP_PROP_POS_MSEC, (t - near / 2) * 1000)
+            ok = cap.grab()
+            p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if ok and t - near <= p <= t:
+                return cap
+            _BAD_SEEK.add(path)           # 這支跳轉不可靠，之後直接依序讀
             cap.release()
-    finally:
-        if wr is not None:
-            wr.release()
-    if os.path.exists(tmp):
-        if os.path.exists(path):
-            os.remove(path)
-        os.replace(tmp, path)
-
-
-def seek_to(cap, t):
-    """跳到 t 秒之前一點（MKV 跳轉常常跳過頭，所以先往前多退，再逐格讀到 t）"""
-    back = 3.0
-    for _ in range(5):
-        start = max(0.0, t - back)
-        cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
-        ok, _fr = cap.read()
-        pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-        if not ok or pos <= t or start <= 0:
-            cap.set(cv2.CAP_PROP_POS_MSEC, start * 1000)
-            return
-        back *= 2
-    cap.set(cv2.CAP_PROP_POS_MSEC, 0)
+            cap = cv2.VideoCapture(path)
+        while True:                       # 依序讀（只解碼不轉圖，比較快）
+            if not cap.grab():
+                break
+            if cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 >= t - near:
+                break
+    return cap
 
 
 def read_frame_at(path, t):
     """讀取影片 t 秒的那一格（預覽用）；回傳 (frame, 實際秒數)"""
-    cap = cv2.VideoCapture(path)
+    cap = open_at(path, t)
     try:
-        seek_to(cap, t)
         best = None
         while True:
-            ok, fr = cap.read()
-            if not ok:
+            if not cap.grab():
                 break
             pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000
-            best = (fr, pos)
             if pos >= t - 0.05:
+                ok, fr = cap.retrieve()
+                if ok:
+                    best = (fr, pos)
                 break
         return best if best else (None, 0.0)
     finally:

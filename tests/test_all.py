@@ -157,5 +157,29 @@ class TestSamples(unittest.TestCase):
                     self.assertEqual(g[2], x[2], (keys, g, x))
 
 
+    def test_shots_and_clips_every_sample(self):
+        """每支樣本影片（含每秒實際格數和檔頭不符的）：每一筆都要有 3 張截圖和短片，
+        而且車頭截圖上的畫面時間要和判讀的車頭時間一致（差 1 秒內）"""
+        root = os.environ['TW_SAMPLES']
+        import cv2
+        T = osd.default_templates()
+        for f in sorted(glob.glob(os.path.join(root, '*.mkv'))):
+            r = osd.calibrate(f, osd.DEFAULT_RECT)
+            prof = core.Profile()
+            evs = [e for e in core.number_events(core.process([f], [r['offset']], prof)) if e['end'] - e['start'] >= 0.6]
+            out = tempfile.mkdtemp()
+            core.save_frames_and_clips(evs, prof, out, files=[f])
+            for e in evs:
+                self.assertEqual(len(e['shots']), 3, (f, core.fmt_time(e['start'])))
+                self.assertTrue(e['clip'] and os.path.getsize(os.path.join(out, '短片', e['clip'])) > 0, (f, core.fmt_time(e['start'])))
+                img = cv2.imdecode(np.fromfile(os.path.join(out, '截圖', e['shots'][0]), np.uint8), cv2.IMREAD_COLOR)
+                d, txt, _w = osd.read_datetime(img, osd.DEFAULT_RECT, osd.DEFAULT_FORMAT, T)
+                self.assertIsNotNone(d, (f, txt))
+                self.assertLess(abs(d.timestamp() - e['start']), 1.0, (f, txt, core.fmt_time(e['start'])))
+            fr, pos = core.read_frame_at(f, 550.0)        # 預覽：影片後段也要讀得到
+            self.assertIsNotNone(fr, f)
+            self.assertLess(abs(pos - 550.0), 0.2, f)
+
+
 if __name__ == '__main__':
     unittest.main()

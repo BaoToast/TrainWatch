@@ -240,9 +240,8 @@ def learn(path, t0, shown, rect, fmt=DEFAULT_FORMAT, seconds=13.0):
     「教程式認字」：t0（影片內秒數）那一格畫面上顯示的時間是 shown（datetime）。
     程式往後讀，最後一位秒數每變一次就加一秒當答案，收集 0～9 的字樣。回傳 (templates, 缺少的數字)
     """
-    from .core import seek_to
-    cap = cv2.VideoCapture(path)
-    seek_to(cap, t0)
+    from .core import open_at
+    cap = open_at(path, t0)
     last_s = tokens(fmt)['S'][0] + 1
     acc = collections.defaultdict(list)
     prev, sec = None, 0
