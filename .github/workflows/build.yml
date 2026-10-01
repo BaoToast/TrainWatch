@@ -1,6 +1,10 @@
 # 打包 Windows 免安裝版：每次上傳（push）到 main 都會自動執行。
 # 完成後到 Actions → 這一次執行 → 頁面最下方 Artifacts 下載「TrainWatch-windows」。
-# 推送 v 開頭的標籤（例如 v1.0.0）時，另外建立 Release 並附上 zip。
+# 推送 v 開頭的標籤（例如 v1.0.1）時，另外建立 Release 並附上 zip。
+#
+# 打包方式：附上 Python 官方的「免安裝版（embeddable）」＋程式原始碼，用 .bat 啟動。
+# 不產生自己的 exe —— PyInstaller 做的 exe 沒有數位簽章，曾被公司防毒（機器學習偵測）誤判隔離；
+# 官方 python.exe／pythonw.exe 有 Python Software Foundation 的數位簽章。
 name: build-windows
 
 on:
@@ -12,50 +16,89 @@ on:
 permissions:
   contents: write
 
+env:
+  PY_VER: '3.11.9'        # 要和下載的 embeddable 版本完全一樣（tkinter 檔案從這個版本複製）
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
-          python-version: '3.11'
+          python-version: ${{ env.PY_VER }}
 
-      - name: 安裝套件
+      - name: 安裝套件並跑單元測試
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt
-          pip install pyinstaller==6.10.0
+          python -m unittest discover -s tests -v
 
-      - name: 單元測試
-        run: python -m unittest discover -s tests -v
-
-      - name: 打包
-        run: >
-          pyinstaller --noconfirm --clean --onedir --windowed
-          --name TrainWatch
-          --collect-all cv2
-          main.py
-
-      - name: 整理資料夾
+      - name: 組出免安裝資料夾
         shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           $ver = (Select-String -Path trainwatch/gui.py -Pattern "^VERSION = '(.+)'").Matches[0].Groups[1].Value
           $dst = "列車通過判讀_v$ver"
-          New-Item -ItemType Directory -Force -Path $dst | Out-Null
-          Copy-Item -Recurse dist/TrainWatch/* $dst
+          $rt  = "$dst/runtime"
+          New-Item -ItemType Directory -Force -Path $rt, "$dst/app", "$dst/監測站設定" | Out-Null
+
+          # 1) Python 官方免安裝版
+          Invoke-WebRequest "https://www.python.org/ftp/python/$env:PY_VER/python-$env:PY_VER-embed-amd64.zip" -OutFile embed.zip
+          Expand-Archive embed.zip -DestinationPath $rt
+
+          # 2) 免安裝版沒有 tkinter：從同版本的完整 Python 複製
+          $py = python -c "import sys; print(sys.base_prefix)"
+          Copy-Item "$py/DLLs/_tkinter.pyd", "$py/DLLs/tcl86t.dll", "$py/DLLs/tk86t.dll" $rt
+          Copy-Item -Recurse "$py/Lib/tkinter" "$rt/Lib/tkinter"
+          Copy-Item -Recurse "$py/tcl" "$rt/tcl"
+
+          # 3) 套件裝進 runtime/Lib/site-packages
+          python -m pip install -r requirements.txt --only-binary=:all: --target "$rt/Lib/site-packages"
+
+          # 4) 告訴免安裝版的 Python 去哪裡找：標準函式庫、tkinter、套件、程式
+          $pth = Get-ChildItem "$rt/python*._pth" | Select-Object -First 1
+          $zip = (Get-ChildItem "$rt/python3*.zip" | Select-Object -First 1).Name
+          Set-Content -Path $pth.FullName -Encoding ascii -Value @($zip, '.', 'Lib', 'Lib\site-packages', '..\app', 'import site')
+
+          # 5) 程式、啟動檔、說明
+          Copy-Item main.py "$dst/app/"
+          Copy-Item -Recurse trainwatch "$dst/app/trainwatch"
+          Get-ChildItem -Recurse -Directory -Filter __pycache__ $dst | Remove-Item -Recurse -Force
+          Copy-Item packaging/start.bat "$dst/啟動列車通過判讀.bat"
           Copy-Item docs/使用說明.md "$dst/使用說明.txt"
-          New-Item -ItemType Directory -Force -Path "$dst/監測站設定" | Out-Null
+
           "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
           "DST=$dst" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: 用打包好的 exe 自我測試
+      - name: 確認 Python 執行檔有官方數位簽章
         shell: pwsh
         run: |
-          $p = Start-Process -FilePath "$env:DST/TrainWatch.exe" -ArgumentList "--selftest","selftest.json" -Wait -PassThru
+          foreach ($f in 'python.exe', 'pythonw.exe') {
+            $s = Get-AuthenticodeSignature "$env:DST/runtime/$f"
+            Write-Host "$f：$($s.Status)  $($s.SignerCertificate.Subject)"
+            if ($s.Status -ne 'Valid') { throw "$f 沒有有效的數位簽章" }
+          }
+
+      - name: 用免安裝資料夾自我測試（判讀、短片、Excel、視窗）
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $env:TRAINWATCH_HOME = (Resolve-Path $env:DST).Path
+          $py = "$env:DST/runtime/python.exe"
+          & $py -c "import sys; print(sys.version); print(sys.path)"
+          & $py "$env:DST/app/main.py" --selftest selftest.json
+          $code = $LASTEXITCODE
           Get-Content selftest.json -Encoding utf8
-          if ($p.ExitCode -ne 0) { throw "自我測試失敗（代碼 $($p.ExitCode)）" }
+          if ($code -ne 0) { throw "自我測試失敗（代碼 $code）" }
+          # 視窗：真的建立主畫面 2 秒後關閉
+          & $py -c "import tkinter as tk; from trainwatch import gui; r = tk.Tk(); gui.App(r); r.after(2000, r.destroy); r.mainloop(); print('GUI OK')"
+          if ($LASTEXITCODE -ne 0) { throw "視窗無法開啟" }
+          # 測試過程不可以在資料夾裡留下東西
+          Remove-Item -Force -ErrorAction SilentlyContinue "$env:DST/錯誤紀錄.txt"
+          Get-ChildItem "$env:DST/監測站設定" | Remove-Item -Force -Recurse
+          Get-ChildItem -Recurse -Directory -Filter __pycache__ $env:DST | Remove-Item -Recurse -Force
 
       - name: 壓縮
         shell: pwsh
