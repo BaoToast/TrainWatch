@@ -1,7 +1,7 @@
-"""
+r"""
 自我測試：產生一段「假列車」影片（灰色背景＋一個方塊由左往右、一個由右往左通過），用正式的判讀流程跑一次。
-用途：① 單元測試 ② GitHub 打包完成後，在 Windows 上實際執行 exe 驗證（影片讀寫、OpenCV、判讀都能動）。
-執行：TrainWatch.exe --selftest 結果.json
+用途：① 單元測試 ② GitHub 打包完成後，用免安裝資料夾裡的 Python 在 Windows 上實際驗證（影片讀寫、OpenCV、判讀都能動）。
+執行：runtime\python.exe app\main.py --selftest 結果.json
 """
 from __future__ import annotations
 

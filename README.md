@@ -3,6 +3,20 @@
 從固定攝影機的長時間錄影，判讀列車車頭到達、車尾離開參考線的時間與方向。
 Windows 免安裝版由 GitHub Actions 自動打包（`.github/workflows/build.yml`），使用者不需要安裝 Python。
 
+免安裝版的結構（v1.0.1 起）：
+
+```
+列車通過判讀_v1.0.1/
+  啟動列車通過判讀.bat   ← packaging/start.bat（只能用 ASCII：cmd 以系統字碼頁讀 .bat）
+  使用說明.txt
+  監測站設定/
+  runtime/               ← Python 官方 embeddable 3.11.9＋從同版本完整 Python 複製的 tkinter＋site-packages
+  app/                   ← main.py、trainwatch/
+```
+
+**不要改回 PyInstaller**：v1.0.0 用 PyInstaller 做的 TrainWatch.exe 沒有數位簽章，被使用者公司的防毒（趨勢科技 Apex One 機器學習偵測）
+判成 Troj.Win32.TRX.XXPE50FFF110 隔離。改用官方簽章的 python.exe／pythonw.exe 後，打包流程會檢查簽章有效才產出。
+
 - 使用者操作說明：`docs/使用說明.md`（打包時會複製成 `使用說明.txt` 放進 zip）
 - 修正紀錄（唯一的一份）：`docs/修正清單.md`
 
@@ -10,7 +24,8 @@ Windows 免安裝版由 GitHub Actions 自動打包（`.github/workflows/build.y
 
 | 檔案 | 內容 |
 |---|---|
-| `main.py` | 進入點；`--selftest 結果.json` 跑自我測試 |
+| `main.py` | 進入點；`--selftest 結果.json` 跑自我測試；啟動失敗時寫「錯誤紀錄.txt」並用 Windows 內建訊息框顯示 |
+| `packaging/start.bat` | 免安裝版的啟動檔 |
 | `trainwatch/core.py` | 判讀演算法（背景、參考線佔用、覆蓋率、方向、亮度修正、截圖與短片） |
 | `trainwatch/osd.py` | 讀畫面時間字幕（等寬字切格＋0～9 字樣相關比對＋整支投票） |
 | `trainwatch/export.py` | Excel／CSV／results.json |
@@ -59,5 +74,5 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 ## 發布
 
 1. 改 `trainwatch/gui.py` 的 `VERSION`。
-2. 上傳到 GitHub（main）→ Actions 自動測試、打包，並用打包好的 exe 跑 `--selftest`。
-3. Actions 該次執行頁面最下方 Artifacts 下載 `TrainWatch-windows`；推送 `v1.0.0` 這種標籤則另外建立 Release。
+2. 上傳到 GitHub（main）→ Actions 自動跑單元測試、組出免安裝資料夾、檢查 Python 數位簽章，再用資料夾裡的 Python 跑 `--selftest` 並實際開一次視窗。
+3. Actions 該次執行頁面最下方 Artifacts 下載 `TrainWatch-windows`；推送 `v1.0.1` 這種標籤則另外建立 Release。

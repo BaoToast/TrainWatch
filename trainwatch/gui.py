@@ -18,7 +18,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.0'
+VERSION = '1.0.1'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -26,7 +26,10 @@ CANVAS_W, CANVAS_H = 900, 506
 
 
 def app_dir():
-    """程式所在資料夾（打包後＝exe 旁邊），監測站設定存在這裡"""
+    """程式的最上層資料夾（「啟動列車通過判讀.bat」所在處），監測站設定存在這裡"""
+    home = os.environ.get('TRAINWATCH_HOME')
+    if home and os.path.isdir(home):
+        return os.path.abspath(home)
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
