@@ -1,5 +1,6 @@
 # 打包 Windows 免安裝版：每次上傳（push）到 main 都會自動執行。
-# 完成後到 Actions → 這一次執行 → 頁面最下方 Artifacts 下載「TrainWatch-windows」。
+# 完成後到 Actions → 這一次執行 → 頁面最下方 Artifacts 下載「TrainWatch_v版本_windows.zip」（只要解壓縮一次）。
+# 用到的 GitHub 工具都是 Node.js 24 的版本（2026-10-01 確認：checkout@v5、setup-python@v6、upload-artifact@v7、action-gh-release@v3）。
 # 推送 v 開頭的標籤（例如 v1.0.1）時，另外建立 Release 並附上 zip。
 #
 # 打包方式：附上 Python 官方的「免安裝版（embeddable）」＋程式原始碼，用 .bat 啟動。
@@ -104,13 +105,14 @@ jobs:
         shell: pwsh
         run: Compress-Archive -Path "$env:DST" -DestinationPath "TrainWatch_v$($env:VER)_windows.zip"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
-          name: TrainWatch-windows
           path: TrainWatch_v*_windows.zip
+          archive: false          # 已經是 zip，不要再包一層（下載後只要解壓縮一次）
+          if-no-files-found: error
 
       - name: 建立 Release（只有推送 v 標籤時）
         if: startsWith(github.ref, 'refs/tags/v')
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           files: TrainWatch_v*_windows.zip
