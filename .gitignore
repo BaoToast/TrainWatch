@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.spec
+判讀結果_*/
+監測站設定/
+*.mkv
+*.mp4
+*.avi
+expected.json
