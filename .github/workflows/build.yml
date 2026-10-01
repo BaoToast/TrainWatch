@@ -1,0 +1,73 @@
+# 打包 Windows 免安裝版：每次上傳（push）到 main 都會自動執行。
+# 完成後到 Actions → 這一次執行 → 頁面最下方 Artifacts 下載「TrainWatch-windows」。
+# 推送 v 開頭的標籤（例如 v1.0.0）時，另外建立 Release 並附上 zip。
+name: build-windows
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 安裝套件
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller==6.10.0
+
+      - name: 單元測試
+        run: python -m unittest discover -s tests -v
+
+      - name: 打包
+        run: >
+          pyinstaller --noconfirm --clean --onedir --windowed
+          --name TrainWatch
+          --collect-all cv2
+          main.py
+
+      - name: 整理資料夾
+        shell: pwsh
+        run: |
+          $ver = (Select-String -Path trainwatch/gui.py -Pattern "^VERSION = '(.+)'").Matches[0].Groups[1].Value
+          $dst = "列車通過判讀_v$ver"
+          New-Item -ItemType Directory -Force -Path $dst | Out-Null
+          Copy-Item -Recurse dist/TrainWatch/* $dst
+          Copy-Item docs/使用說明.md "$dst/使用說明.txt"
+          New-Item -ItemType Directory -Force -Path "$dst/監測站設定" | Out-Null
+          "VER=$ver" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          "DST=$dst" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+      - name: 用打包好的 exe 自我測試
+        shell: pwsh
+        run: |
+          $p = Start-Process -FilePath "$env:DST/TrainWatch.exe" -ArgumentList "--selftest","selftest.json" -Wait -PassThru
+          Get-Content selftest.json -Encoding utf8
+          if ($p.ExitCode -ne 0) { throw "自我測試失敗（代碼 $($p.ExitCode)）" }
+
+      - name: 壓縮
+        shell: pwsh
+        run: Compress-Archive -Path "$env:DST" -DestinationPath "TrainWatch_v$($env:VER)_windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: TrainWatch-windows
+          path: TrainWatch_v*_windows.zip
+
+      - name: 建立 Release（只有推送 v 標籤時）
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: TrainWatch_v*_windows.zip
