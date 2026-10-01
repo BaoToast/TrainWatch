@@ -78,7 +78,86 @@ class TestCore(unittest.TestCase):
         self.assertTrue(r['ok'], r['problems'])
 
 
+class TestScenarios(unittest.TestCase):
+    """驗收測試（假影片）：列車停駛、兩列車重疊、車廂空隙、曝光變化。允許誤差：車頭 ±0.3 秒、車尾 ±0.4 秒"""
+
+    def run_case(self, seconds, **kw):
+        d = tempfile.mkdtemp()
+        got, exp = selftest.run_scene(os.path.join(d, 's.avi'), seconds, **kw)
+        return got, exp
+
+    def check(self, got, want, dirs=None):
+        self.assertEqual(len(got), len(want), got)
+        for i, (g, (a, b)) in enumerate(zip(got, want)):
+            self.assertLess(abs(g[0] - a), 0.3, (g, a, b))
+            self.assertLess(abs(g[1] - b), 0.4, (g, a, b))
+            if dirs:
+                self.assertEqual(g[2], dirs[i], g)
+
+    def test1_normal(self):
+        got, exp = self.run_case(20, trains=[dict(t0=5, d=1)])
+        self.check(got, exp, ['往右'])
+
+    def test2_stop_5s(self):
+        got, exp = self.run_case(30, trains=[dict(t0=5, d=1, stops=[(6.0, 5)])])
+        self.check(got, exp, ['往右'])
+        self.assertIn('停止', got[0][3])
+
+    def test3_stop_35s(self):
+        got, exp = self.run_case(120, trains=[dict(t0=5, d=-1, stops=[(6.0, 35)])])
+        self.check(got, exp, ['往左'])
+        self.assertGreater(got[0][1] - got[0][0], 35)
+
+    def test4_two_trains_overlap(self):
+        """A 10～30 秒、B 20～40 秒（雙軌、反方向）→ 一筆 10～40 秒"""
+        got, exp = self.run_case(50, trains=[dict(t0=10, d=1, speed=40, length=800, y=(166, 188)),
+                                             dict(t0=20, d=-1, speed=40, length=800, y=(192, 214))])
+        self.check(got, [(10, 40)])
+
+    def test5_two_trains_clear_gap(self):
+        got, exp = self.run_case(50, trains=[dict(t0=10, d=1, speed=40, length=400),
+                                             dict(t0=30, d=-1, speed=40, length=400)])
+        self.check(got, exp, ['往右', '往左'])
+
+    def test6_coach_gaps(self):
+        got, exp = self.run_case(40, trains=[dict(t0=5, d=1, speed=60, length=1200, car=180, gap=30)])
+        self.check(got, exp, ['往右'])
+
+    def test7_exposure_no_train(self):
+        got, exp = self.run_case(40, exposure=[(10, 20, 0.6), (25, 26, 1.4)], blobs=[(30, 33, 420, 190, 30)])
+        self.assertEqual(got, [])
+
+    def test7b_darken_after_train(self):
+        got, exp = self.run_case(30, trains=[dict(t0=5, d=1)], exposure=[(7.3, 14, 0.75)])
+        self.check(got, exp, ['往右'])
+
+    def test_shots_cancel(self):
+        """產生截圖與短片時按取消，要真的停下來"""
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, 's.avi')
+        selftest.make_scene(f, 40, trains=[dict(t0=5, d=1), dict(t0=25, d=-1)])
+        prof = core.Profile()
+        evs = core.number_events(core.process([f], [0.0], prof))
+        core.save_frames_and_clips(evs, prof, os.path.join(d, 'out'), cancel=lambda: True, files=[f])
+        self.assertEqual(sum(len(e['shots']) for e in evs), 0)
+
+
 class TestExport(unittest.TestCase):
+    def test_noise_txt(self):
+        d = tempfile.mkdtemp()
+        b = dt.datetime(2023, 9, 18, 11, 1, 26).timestamp()
+        evs = [dict(start=b + 0.7, end=b + 2.2, valid=True),
+               dict(start=b + 300, end=b + 305, valid=False),                 # 非列車不可以出現
+               dict(start=b + 510.0, end=b + 516.0, valid=True),
+               dict(start=b - 100, end=b - 90, valid=True)]                   # 順序要依時間排
+        p = os.path.join(d, 'x.txt')
+        self.assertEqual(export.write_noise_txt(p, evs), 3)
+        with open(p, 'rb') as fh:
+            raw = fh.read()
+        self.assertEqual(raw, b'2023/09/18,10:59:46,10:59:56,10,FR,,A\r\n'
+                              b'2023/09/18,11:01:26,11:01:29,10,FR,,A\r\n'
+                              b'2023/09/18,11:09:56,11:10:02,10,FR,,A\r\n')
+
     def test_roundtrip(self):
         d = tempfile.mkdtemp()
         base = dt.datetime(2026, 1, 2, 10, 0, 0).timestamp()
@@ -157,6 +236,16 @@ class TestSamples(unittest.TestCase):
                     self.assertEqual(g[2], x[2], (keys, g, x))
 
 
+    def test_no_false_long_events(self):
+        """樣本影片裡沒有停駛的列車，所以每一支單獨判讀時，不可以出現超過 30 秒的「列車」。
+        （v1.0.4 開發時：初始背景改用整支影片的中位數，傍晚那支一開頭就被誤判成 54 秒的列車）"""
+        root = os.environ['TW_SAMPLES']
+        for f in sorted(glob.glob(os.path.join(root, '*.mkv'))):
+            r = osd.calibrate(f, osd.DEFAULT_RECT)
+            for e in core.process([f], [r['offset']], core.Profile()):
+                if e['valid']:
+                    self.assertLess(e['end'] - e['start'], 30, (f, core.fmt_time(e['start']), core.fmt_time(e['end'])))
+
     def test_shots_and_clips_every_sample(self):
         """每支樣本影片（含每秒實際格數和檔頭不符的）：每一筆都要有 3 張截圖和短片，
         而且車頭截圖上的畫面時間要和判讀的車頭時間一致（差 1 秒內）"""
@@ -175,7 +264,9 @@ class TestSamples(unittest.TestCase):
                 img = cv2.imdecode(np.fromfile(os.path.join(out, '截圖', e['shots'][0]), np.uint8), cv2.IMREAD_COLOR)
                 d, txt, _w = osd.read_datetime(img, osd.DEFAULT_RECT, osd.DEFAULT_FORMAT, T)
                 self.assertIsNotNone(d, (f, txt))
-                self.assertLess(abs(d.timestamp() - e['start']), 1.0, (f, txt, core.fmt_time(e['start'])))
+                # 畫面上的秒數是「無條件捨去」顯示：車頭時間 28.0 秒時字幕可能還是 27（差 0.1 秒內的對齊誤差）
+                lag = e['start'] - d.timestamp()
+                self.assertTrue(-0.2 <= lag <= 1.2, (f, txt, core.fmt_time(e['start'])))
             fr, pos = core.read_frame_at(f, 550.0)        # 預覽：影片後段也要讀得到
             self.assertIsNotNone(fr, f)
             self.assertLess(abs(pos - 550.0), 0.2, f)

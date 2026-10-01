@@ -47,16 +47,18 @@ class Profile:
     min_duration: float = 0.6             # 少於幾秒視為閃爍（排除，列在「已排除」）
     min_coverage: float = 0.25            # 軌道範圍覆蓋率最大值低於此值 → 非列車（排除）
     min_both: float = 0.15                # 參考線左右兩側「同時」都被擋住的比例最大值低於此值 → 非列車（車燈照射、路上的車）
-    long_event: float = 600.0             # 超過幾秒標記「需人工確認」（可能停車或畫面變化）
-    static_motion: float = 2.5            # 參考線上前後兩格的變化小於此值 → 視為畫面靜止
-    static_sec: float = 3.0               # 佔用中畫面靜止超過幾秒 → 結束這一筆並重新學背景
-                                          # （夜間列車經過後攝影機亮度會跳一下，背景對不上，會一直以為還有車）
+    long_event: float = 600.0             # 超過幾秒只標記「需人工確認」（不會因此結束，也不會重學背景）
+    static_motion: float = 2.5            # 參考線上前後兩格的變化小於此值 → 視為畫面靜止（列車停住）
+    static_sec: float = 3.0               # 佔用中靜止超過幾秒 → 備註「列車曾停止」（只記錄，不結束事件）
+    max_static: float = 1800.0            # 佔用中「完全靜止」超過幾秒才放棄等待：在最後有動靜的時間結束並標需確認
+                                          # （防止攝影機被撞歪、畫面永久改變時，整天變成一筆）
     clip_before: float = 3.0              # 短片：事件前幾秒
     clip_after: float = 3.0               # 短片：事件後幾秒
     make_clips: bool = True
     osd_rect: list = dataclasses.field(default_factory=lambda: [14, 8, 204, 24])   # 時間字幕外框 [x0,y0,x1,y1]
     osd_format: str = 'YYYY-MM-DD HH:MM:SS'
     osd_templates: list = None            # 「教程式認字」學到的字樣；None＝內建
+    frame_size: list = None               # 畫參考線時的畫面大小 [寬, 高]；影片大小不同時要警告
 
     def to_json(self):
         return json.dumps(dataclasses.asdict(self), ensure_ascii=False, indent=2)
@@ -92,7 +94,8 @@ class Detector:
     """逐格餵影像（灰階、已裁切到工作範圍），產生事件。可跨檔案連續使用（背景延續）。"""
     SIDE_WINDOW = 2.0      # 事件前後看幾秒
     EDGE_WINDOW = 1.5      # 事件開頭／結尾看幾秒
-    MAX_REC = 20000        # 方向判斷最多記幾格（很長的事件不會吃光記憶體）
+    HEAD_SEC = 60.0        # 方向判斷：保留事件開頭幾秒的逐格資料
+    TAIL_SEC = 60.0        #           與最後幾秒（列車停很久也不會吃光記憶體，車頭／車尾的證據都在）
 
     def __init__(self, profile: Profile, crop):
         self.p = profile
@@ -128,7 +131,14 @@ class Detector:
         if gain != 1.0:
             g = g / gain        # 攝影機自動調亮度（例如亮的列車經過後整個畫面變暗）→ 先還原再比較
         diff = np.abs(g - self.bg)
-        motion = float(np.abs(g - self.prev)[self.ref_mask].mean()) if (self.prev is not None and self.prev.shape == g.shape) else 99.0
+        if self.prev is not None and self.prev.shape == g.shape:
+            fd = np.abs(g - self.prev)
+            tx0, ty0, tx1, ty1 = self.tr
+            # 有沒有在動：參考線上的平均變化，或軌道範圍內明顯變化的像素比例（車身顏色均勻時參考線上看不出在動）
+            moving = (float(fd[self.ref_mask].mean()) > self.p.static_motion
+                      or float((fd[ty0:ty1, tx0:tx1] > 10).mean()) > 0.004)
+        else:
+            moving = True
         self.prev = g
         score = float(diff[self.ref_mask].mean()) if self.ref_mask.any() else 0.0
         tx0, ty0, tx1, ty1 = self.tr
@@ -148,22 +158,30 @@ class Detector:
         if self.cur is None:
             if on:
                 self.cur = dict(at_file_start=(self.first_t is not None and t_abs - self.first_t < 2.0),start=t_abs, start_file=file, start_pos=pos, end=t_abs, end_file=file, end_pos=pos,
-                                peak=score, coverage=cov, sat=[sat], rec=list(self.hist),
+                                peak=score, coverage=cov, sat=[sat], rec=list(self.hist), rec_tail=[],
                                 last_motion=t_abs, scores=[(t_abs, score, file, pos)], tail=[(t_abs, score, file, pos)],
-                                static_end=False)
+                                static_now=0.0, static_max=0.0, static_end=False)
         else:
             c = self.cur
-            if len(c['rec']) < self.MAX_REC:
+            if t_abs - c['start'] <= self.HEAD_SEC:
                 c['rec'].append((t_abs, active))
-            if motion > self.p.static_motion:
+            else:
+                c['rec_tail'].append((t_abs, active))
+                while c['rec_tail'] and t_abs - c['rec_tail'][0][0] > self.TAIL_SEC:
+                    c['rec_tail'].pop(0)
+            if moving:
                 c['last_motion'] = t_abs
+            c['static_now'] = t_abs - c['last_motion']
+            if occupied:
+                c['static_max'] = max(c['static_max'], c['static_now'])
             if t_abs - c['start'] < 15 and len(c['scores']) < 400:
                 c['scores'].append((t_abs, score, file, pos))
             c['tail'].append((t_abs, score, file, pos))
             while t_abs - c['tail'][0][0] > 15:
                 c['tail'].pop(0)
-            if occupied and t_abs - c['last_motion'] > self.p.static_sec:
-                # 還算「佔用」但參考線上已經好幾秒完全不動：車已經走了、背景（亮度）變了 → 在最後有動靜的時間結束
+            if occupied and t_abs - c['last_motion'] > self.p.max_static:
+                # 列車停住不算離開。只有「完全不動」超過 max_static（預設 30 分鐘）才放棄等待，
+                # 避免攝影機被撞歪、畫面永久改變時整天變成一筆；在最後有動靜的時間結束並標記需人工確認
                 if c['last_motion'] < c['end']:
                     c['end'] = c['last_motion']
                     c['end_file'], c['end_pos'] = file, pos - (t_abs - c['last_motion'])
@@ -185,11 +203,16 @@ class Detector:
                     self.pending_close = t_abs
                 if t_abs - c['end'] > max(self.p.merge_gap, self.SIDE_WINDOW):
                     self._close()
-        # 背景更新：沒有事件時一律學習（畫面某處永久改變時才不會一直卡在「有點不一樣」）；事件中幾乎不動
-        a = 0.02 if self.cur is None else 0.0005
-        if self.cur is not None and t_abs - self.cur['start'] > self.p.long_event:
-            a = 0.02   # 佔用太久（停車或畫面整個變了）：開始重新學背景
-        self.bg = self.bg * (1 - a) + g * gain * a
+        # 背景更新：沒有事件時一律學習（畫面某處永久改變時才不會一直卡在「有點不一樣」）；
+        # 事件進行中（含列車停住的時候）完全凍結，停著的列車不會被學成背景。光線變化交給亮度修正（_exposure）處理。
+        if self.cur is not None:
+            return
+        # 沒有事件時：和背景差很多的像素（例如列車已經進入軌道範圍、還沒碰到參考線）只用很慢的速度學，
+        # 慢速列車才不會在碰到參考線之前就被學進背景；其他像素照常學（光線、天色變化）
+        raw = g * gain
+        fast = diff < self.p.pixel_diff
+        self.bg = np.where(fast, self.bg * 0.98 + raw * 0.02, self.bg * 0.999 + raw * 0.001)
+        a = 0.02
         if self.small is not None:
             if self.bg_small is None or self.bg_small.shape != self.small.shape:
                 self.bg_small = self.small.copy()
@@ -233,7 +256,7 @@ class Detector:
 
     def _onset(self, c):
         """回傳 (車頭時間差, 車尾時間差)：參考線後側（右／下）中位數減前側（左／上）中位數，>0 表示往右／往下"""
-        rec = [(t, a) for (t, a) in c['rec'] if c['start'] - self.SIDE_WINDOW <= t <= c['end'] + self.SIDE_WINDOW]
+        rec = [(t, a) for (t, a) in c['rec'] + c.get('rec_tail', []) if c['start'] - self.SIDE_WINDOW <= t <= c['end'] + self.SIDE_WINDOW]
         if len(rec) < 3:
             return 0.0, 0.0
         T = np.array([t for t, _ in rec])
@@ -339,7 +362,10 @@ class Detector:
                 reasons.append('方向不確定')
             if c.get('static_end'):
                 ev['need_check'] = True
-                reasons.append('結束前畫面靜止（若列車停在參考線上，車尾時間請確認）')
+                reasons.append('參考線上超過 %d 分鐘完全沒有動靜，程式在最後有動靜的時間結束（可能停車很久或畫面永久改變，請確認車尾時間）'
+                               % round(self.p.max_static / 60))
+            elif c.get('static_max', 0) >= self.p.static_sec:
+                reasons.append('列車曾在參考線上停止約 %d 秒（已計入通過時間）' % round(c['static_max']))
             if dur > self.p.long_event:
                 ev['need_check'] = True
                 reasons.append('佔用時間很長（可能停車或畫面變化）')
@@ -421,22 +447,38 @@ def process(files: List[str], bases: List[float], profile: Profile,
     return det.finish() if det else []
 
 
-def initial_background(path, crop, seconds=90.0, n=31):
-    """第一支影片開頭 seconds 秒內平均取 n 格，取中位數當初始背景"""
-    cap = cv2.VideoCapture(path)
+def initial_background(path, crop, n=31, seconds=90.0):
+    """第一支影片開頭 seconds 秒內平均取 n 格，取中位數當初始背景（影片開頭有列車經過也不會被學進去）。
+    不取整支影片：傍晚、清晨光線變化大，整支的中位數和開頭的畫面差很多，會造成一開始就誤判有車（v1.0.4 開發時實測）。
+    先試跳轉（快）；跳轉不可靠的影片（實際每秒格數和檔頭不同）改成從頭依序讀。"""
+    info = video_info(path) or {}
+    dur = min(seconds, info.get('dur') or seconds)
     x0, y0, x1, y1 = crop
-    frames, step, nxt = [], seconds / n, 0.0
+    prep = lambda fr: cv2.GaussianBlur(cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), (5, 5), 0)
+    targets = [dur * (k + 0.5) / n for k in range(n)]
+    frames = []
+    cap = cv2.VideoCapture(path)
     try:
-        while True:
+        ok_seek = True
+        for t in targets:
+            cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
             ok, fr = cap.read()
-            if not ok:
+            p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            if not ok or abs(p - t) > 2.0:
+                ok_seek = False
                 break
-            pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            if pos > seconds:
-                break
-            if pos >= nxt:
-                frames.append(cv2.GaussianBlur(cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), (5, 5), 0))
-                nxt += step
+            frames.append(prep(fr))
+        if not ok_seek:
+            _BAD_SEEK.add(path)
+            cap.release()
+            cap = cv2.VideoCapture(path)
+            frames, i = [], 0
+            while i < len(targets) and cap.grab():
+                if cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 >= targets[i]:
+                    ok, fr = cap.retrieve()
+                    if ok:
+                        frames.append(prep(fr))
+                    i += 1
     finally:
         cap.release()
     if len(frames) < 3:

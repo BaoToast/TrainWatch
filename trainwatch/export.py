@@ -170,3 +170,32 @@ def write_csv(path, events):
         for e in valid:
             w.writerow(row_values(e))
     os.replace(tmp, path)
+
+
+# ---------------------------------------------------------------- 噪音分析程式用
+NOISE_SUFFIX = '10,FR,,A'        # 噪音分析程式固定要的欄位（使用者提供的範例格式）
+
+
+def noise_lines(events):
+    """每一筆列車一行：日期,進入時間,離開時間,10,FR,,A（例：2023/09/18,11:01:26,11:01:28,10,FR,,A）
+    只輸出「是列車」的事件（已排除、人工改為非列車的都不輸出），依進入時間排序。
+    秒數取整：進入時間無條件捨去、離開時間無條件進位，噪音時段一定包住整列車。"""
+    import math
+    out = []
+    for e in sorted((e for e in events if e.get('valid')), key=lambda e: e['start']):
+        a = dt.datetime.fromtimestamp(math.floor(e['start'] + 1e-6))
+        b = dt.datetime.fromtimestamp(math.ceil(e['end'] - 1e-6))
+        out.append('%s,%s,%s,%s' % (a.strftime('%Y/%m/%d'), a.strftime('%H:%M:%S'), b.strftime('%H:%M:%S'), NOISE_SUFFIX))
+    return out
+
+
+def write_noise_txt(path, events):
+    """記事本格式（純英數字、Windows 換行），回傳寫了幾行"""
+    lines = noise_lines(events)
+    tmp = path + '.tmp'
+    with open(tmp, 'w', encoding='ascii', newline='\r\n') as fh:
+        for ln in lines:
+            fh.write(ln + '\n')
+    os.replace(tmp, path)
+    return len(lines)
+

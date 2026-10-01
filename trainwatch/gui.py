@@ -8,6 +8,7 @@ import queue
 import subprocess
 import sys
 import threading
+import time
 import tkinter as tk
 import traceback
 from tkinter import filedialog, messagebox, simpledialog, ttk
@@ -18,11 +19,18 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.3'
+VERSION = '1.0.4'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
 CANVAS_W, CANVAS_H = 900, 506
+MAX_FILES = 300            # 一次最多加入幾支影片（10 分鐘一支約 2 天）；清單和判讀都還順，再多建議分批
+SEC_PER_VIDEO_MIN = (1.0, 2.0)   # 預估：每 1 分鐘影片判讀約需幾秒（快的電腦～慢的電腦）
+
+# 進階設定的合理範圍（超出範圍不給存）
+PARAM_RANGE = dict(on_level=(3, 100), off_level=(1, 99), pixel_diff=(3, 120), merge_gap=(0.1, 10),
+                   min_duration=(0.1, 10), min_coverage=(0.01, 1.0), min_both=(0.0, 1.0), static_sec=(1, 600),
+                   max_static=(60, 86400), long_event=(10, 86400), clip_before=(0, 30), clip_after=(0, 30))
 
 
 def app_dir():
@@ -112,6 +120,7 @@ class App:
         self.nb.add(self.tab1, text='  1. 影片與參考線  ')
         self.nb.add(self.tab2, text='  2. 檢視與修改結果  ')
         self._build_tab1()
+        self.update_count()
         self._build_tab2()
         self._load_last_profile()
         root.protocol('WM_DELETE_WINDOW', self.on_close)
@@ -172,7 +181,7 @@ class App:
         ttk.Button(r, text='清空', width=5, command=self.clear_files).pack(side='left', padx=(4, 0))
         ttk.Button(r, text='依時間排序', command=self.sort_files).pack(side='left', padx=(4, 0))
         fr = ttk.Frame(box); fr.pack(fill='both', expand=True, padx=6, pady=2)
-        self.tv_files = ttk.Treeview(fr, columns=('name', 'start'), show='headings', selectmode='extended', height=8)
+        self.tv_files = ttk.Treeview(fr, columns=('name', 'start'), show='headings', selectmode='extended', height=6)
         self.tv_files.heading('name', text='檔名'); self.tv_files.heading('start', text='畫面上的開始時間')
         self.tv_files.column('name', width=150, anchor='w'); self.tv_files.column('start', width=160, anchor='center')
         sb = ttk.Scrollbar(fr, orient='vertical', command=self.tv_files.yview)
@@ -181,6 +190,8 @@ class App:
         self.tv_files.tag_configure('bad', foreground='#b00000')
         self.tv_files.tag_configure('manual', foreground='#0050a0')
         self.tv_files.bind('<<TreeviewSelect>>', lambda e: self.on_file_select())
+        self.var_count = tk.StringVar(value='')
+        ttk.Label(box, textvariable=self.var_count, foreground='#1060c0', wraplength=330, justify='left').pack(fill='x', padx=6)
         ttk.Label(box, style='Hint.TLabel', wraplength=330, justify='left', text=(
             '開始時間是讀畫面上的時間字幕，不看檔名。讀不到（紅字）時請選取該檔，'
             '在下面填畫面時間；藍字＝手動填的。')).pack(fill='x', padx=6)
@@ -254,6 +265,7 @@ class App:
         self.var_sum = tk.StringVar(value='')
         ttk.Label(top, textvariable=self.var_sum).pack(side='left', padx=8)
         ttk.Button(top, text='開啟結果資料夾', command=lambda: self.result_dir and open_path(self.result_dir)).pack(side='right')
+        ttk.Button(top, text='輸出噪音分析用 TXT', command=self.export_noise).pack(side='right', padx=(6, 6))
         ttk.Button(top, text='儲存修改並重新輸出 Excel', style='Big.TButton', command=self.save_results).pack(side='right', padx=6)
 
         body = ttk.Frame(t); body.pack(fill='both', expand=True, padx=4)
@@ -335,6 +347,8 @@ class App:
 
     def save_profile(self):
         p = self._collect_profile()
+        if self.cur_frame is not None:
+            p.frame_size = [int(self.cur_frame.shape[1]), int(self.cur_frame.shape[0])]
         fn = ''.join('_' if c in '\\/:*?"<>|' else c for c in p.name) + '.json'
         path = os.path.join(self.prof_dir, fn)
         if os.path.exists(path) and not messagebox.askyesno(APP, '「%s」已存在，要覆蓋嗎？' % p.name):
@@ -395,8 +409,9 @@ class App:
                  ('min_duration', '最短秒數', '少於此秒數視為閃爍（列在已排除）'),
                  ('min_coverage', '最小軌道覆蓋率（0～1）', '低於此值視為非列車（汽車、行人）'),
                  ('min_both', '參考線兩側同時被擋的最小比例（0～1）', '低於此值視為非列車（車燈照射）'),
-                 ('static_sec', '畫面靜止幾秒就結束（秒）', '列車經過後攝影機亮度跳動用'),
-                 ('long_event', '很長的佔用（秒）', '超過標記需確認，並重新學習背景'),
+                 ('static_sec', '列車停止幾秒以上要備註（秒）', '只記錄「曾停止」，不會結束這一筆'),
+                 ('max_static', '完全不動多久才放棄等待（秒）', '預設 1800＝30 分鐘；防止畫面永久改變時整天變一筆'),
+                 ('long_event', '很長的佔用（秒）', '超過只標記需確認'),
                  ('clip_before', '短片：事件前秒數', ''),
                  ('clip_after', '短片：事件後秒數', '')]
         vars_ = {}
@@ -422,6 +437,14 @@ class App:
                 vals = {k: float(v.get()) for k, v in vars_.items()}
             except ValueError:
                 messagebox.showerror(APP, '請輸入數字。', parent=w)
+                return
+            bad = []
+            for k, v in vals.items():
+                lo, hi = PARAM_RANGE.get(k, (None, None))
+                if lo is not None and not (lo <= v <= hi):
+                    bad.append('%s：%g～%g' % (dict((i[0], i[1]) for i in items)[k], lo, hi))
+            if bad:
+                messagebox.showerror(APP, '下列數值超出合理範圍：\n' + '\n'.join(bad), parent=w)
                 return
             if vals['off_level'] >= vals['on_level']:
                 messagebox.showerror(APP, '結束門檻需小於開始門檻。', parent=w)
@@ -461,15 +484,17 @@ class App:
         if not paths:
             return
         have = {os.path.normcase(f['path']) for f in self.files}
-        new = []
+        cand = []
         for p in paths:
-            if os.path.normcase(p) in have:
-                continue
-            info = core.video_info(p)
-            if info is None:
-                messagebox.showwarning(APP, '無法開啟：%s' % os.path.basename(p))
-                continue
-            new.append(dict(path=p, info=info, osd=None, manual=None, state='讀取畫面時間中…'))
+            if os.path.normcase(p) not in have and p not in cand:
+                cand.append(p)
+        room = MAX_FILES - len(self.files)
+        if len(cand) > room:
+            messagebox.showwarning(APP, '一次最多加入 %d 支影片，目前已有 %d 支。\n這次只加入前 %d 支，其餘 %d 支沒有加入。\n\n影片更多時請分批判讀。'
+                                   % (MAX_FILES, len(self.files), max(0, room), len(cand) - max(0, room)))
+            cand = cand[:max(0, room)]
+        # 影片資訊與畫面時間都在背景讀，加入很多支也不會卡住
+        new = [dict(path=p, info=None, osd=None, manual=None, state='讀取畫面時間中…') for p in cand]
         self.files.extend(new)
         self.refresh_files()
         if new and not self.tv_files.selection():
@@ -488,6 +513,8 @@ class App:
             T = osd.templates_from_list(prof.osd_templates)
             while self.scan_queue:
                 f = self.scan_queue.pop(0)
+                if f.get('info') is None:
+                    f['info'] = core.video_info(f['path']) or {}
                 try:
                     r = osd.calibrate(f['path'], prof.osd_rect, prof.osd_format, T, dense_seconds=3.0, n_spread=0)
                 except Exception as e:
@@ -552,22 +579,40 @@ class App:
             self.files[int(s)]['manual'] = None
         self.refresh_files()
 
+    def _row(self, f):
+        tag = ()
+        if f.get('info') == {}:
+            txt, tag = '無法開啟這支影片', ('bad',)
+        elif f.get('manual') is not None:
+            txt = f['manual'].strftime('%Y-%m-%d %H:%M:%S') + '（手動）'
+            tag = ('manual',)
+        elif f.get('osd') is None:
+            txt = f.get('state') or ''
+        elif f['osd'].get('ok'):
+            txt = core.fmt_time(f['osd']['offset'], True)[:-2]
+        else:
+            txt = '讀不到，請手動填'
+            tag = ('bad',)
+        return (os.path.basename(f['path']), txt), tag
+
+    def update_count(self):
+        n = len(self.files)
+        mins = sum(((f.get('info') or {}).get('dur') or 600) for f in self.files) / 60.0
+        if n == 0:
+            self.var_count.set('最多可加入 %d 支影片。' % MAX_FILES)
+            return
+        lo, hi = (mins * k / 60.0 for k in SEC_PER_VIDEO_MIN)
+        total = ('%.1f 小時' % (mins / 60)) if mins >= 60 else ('%d 分鐘' % round(mins))
+        self.var_count.set('已加入 %d 支（上限 %d 支），合計約 %s；預估判讀約 %d～%d 分鐘（依電腦速度不同）。'
+                           % (n, MAX_FILES, total, max(1, round(lo)), max(1, round(hi))))
+
     def refresh_files(self):
         sel = self.tv_files.selection()
         self.tv_files.delete(*self.tv_files.get_children())
         for i, f in enumerate(self.files):
-            tag = ()
-            if f.get('manual') is not None:
-                txt = f['manual'].strftime('%Y-%m-%d %H:%M:%S') + '（手動）'
-                tag = ('manual',)
-            elif f.get('osd') is None:
-                txt = f.get('state') or ''
-            elif f['osd'].get('ok'):
-                txt = core.fmt_time(f['osd']['offset'], True)[:-2]
-            else:
-                txt = '讀不到，請手動填'
-                tag = ('bad',)
-            self.tv_files.insert('', 'end', iid=str(i), values=(os.path.basename(f['path']), txt), tags=tag)
+            vals, tag = self._row(f)
+            self.tv_files.insert('', 'end', iid=str(i), values=vals, tags=tag)
+        self.update_count()
         keep = [s for s in sel if int(s) < len(self.files)]
         if keep:
             self.tv_files.selection_set(keep)
@@ -581,7 +626,7 @@ class App:
         f = self.files[int(sel[0])]
         st = self._start_of(f)
         self.var_ftime.set(st.strftime('%Y-%m-%d %H:%M:%S') if st else '')
-        dur = f['info'].get('dur') or 600
+        dur = (f.get('info') or {}).get('dur') or 600
         self.scale.configure(to=max(1.0, dur - 0.5))
         self.schedule_seek(0)
 
@@ -682,6 +727,8 @@ class App:
     def on_release(self, e):
         if self.drag is None:
             return
+        if self.cur_frame is not None:
+            self.profile.frame_size = [int(self.cur_frame.shape[1]), int(self.cur_frame.shape[0])]
         self.on_drag(e)
         self.drag = None
         if self.mode.get() == 'osd':
@@ -751,6 +798,18 @@ class App:
         if msg:
             messagebox.showerror(APP, msg)
             return
+        if self.scan_queue or any(f.get('info') is None for f in self.files):
+            messagebox.showinfo(APP, '還在讀取影片的畫面時間，請等清單上的時間都出現後再開始。')
+            return
+        broken = [os.path.basename(f['path']) for f in self.files if f.get('info') == {}]
+        if broken:
+            messagebox.showerror(APP, '這些影片無法開啟，請先移除：\n' + '\n'.join(broken[:15]))
+            return
+        issues = self.check_files()
+        if issues and not self.confirm('影片檢查', '開始判讀前發現下列狀況：\n\n' + '\n'.join(issues[:15])
+                                       + ('\n…（共 %d 項）' % len(issues) if len(issues) > 15 else '')
+                                       + '\n\n確定要照目前的清單判讀嗎？', ok='仍要判讀', warn=True):
+            return
         prof = self._collect_profile()
         files = [f['path'] for f in self.files]
         manual = [f.get('manual') for f in self.files]
@@ -764,11 +823,54 @@ class App:
             messagebox.showerror(APP, '無法在影片資料夾建立結果資料夾：%s' % e)
             return
         self.cancel_flag = False
+        self.run_t0 = time.time()
         self.btn_run.configure(state='disabled'); self.btn_cancel.configure(state='normal')
         self.pb['value'] = 0
         prof_copy = Profile.from_dict(json.loads(prof.to_json()))
         self.worker = threading.Thread(target=self._work, args=(files, manual, prof_copy, out), daemon=True)
         self.worker.start()
+
+    def check_files(self):
+        """判讀前的檢查：畫面大小不一致、時間順序倒退／重疊／中間缺一段。回傳說明清單（空的＝沒問題）"""
+        out = []
+        sizes = {}
+        for f in self.files:
+            i = f.get('info') or {}
+            sizes.setdefault((i.get('w'), i.get('h')), []).append(os.path.basename(f['path']))
+        if len(sizes) > 1:
+            out.append('● 影片的畫面大小不一致：' + '；'.join('%s×%s 有 %d 支' % (k[0], k[1], len(v)) for k, v in sizes.items())
+                       + '。參考線、軌道範圍是用像素位置畫的，大小不同的影片位置會錯。')
+        fs = self.profile.frame_size
+        if fs and len(sizes) >= 1:
+            diff = [k for k in sizes if list(k) != list(fs)]
+            if diff:
+                out.append('● 這個監測站的參考線是在 %d×%d 的畫面上畫的，但有 %d 支影片的大小不同（例：%s×%s），位置會錯。'
+                           % (fs[0], fs[1], sum(len(sizes[k]) for k in diff), diff[0][0], diff[0][1]))
+        prev = None
+        for f in self.files:
+            st = self._start_of(f)
+            if st is None:
+                continue
+            dur = (f.get('info') or {}).get('dur') or 600
+            name = os.path.basename(f['path'])
+            if prev is not None:
+                p_st, p_end, p_name = prev
+                gap = (st - p_end).total_seconds()
+                if st < p_st:
+                    out.append('● 時間倒退：%s（%s）排在 %s（%s）後面。可以按「依時間排序」。'
+                               % (name, st.strftime('%m-%d %H:%M:%S'), p_name, p_st.strftime('%m-%d %H:%M:%S')))
+                elif gap < -2:
+                    out.append('● 時間重疊 %d 秒：%s 和 %s（可能重複加入同一段錄影）' % (-gap, p_name, name))
+                elif gap > 5:
+                    if gap >= 3600:
+                        g = '%d 小時 %d 分' % (gap // 3600, gap % 3600 // 60)
+                    elif gap >= 60:
+                        g = '%d 分 %d 秒' % (gap // 60, gap % 60)
+                    else:
+                        g = '%d 秒' % gap
+                    out.append('● 中間缺 %s：%s 結束到 %s 開始之間沒有錄影（缺檔？）' % (g, p_name, name))
+            prev = (st, st + dt.timedelta(seconds=dur), name)
+        return out
 
     def cancel_run(self):
         self.cancel_flag = True
@@ -801,7 +903,7 @@ class App:
             evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag)
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
-            core.save_frames_and_clips(evs, prof, out, prog2, files=files)
+            core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files)
             export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing)
             export.write_excel(os.path.join(out, '列車通過紀錄.xlsx'), evs, prof, files, timing)
             export.write_csv(os.path.join(out, '列車通過紀錄.csv'), evs)
@@ -816,12 +918,23 @@ class App:
                 kind = m[0]
                 if kind == 'prog':
                     self.pb['value'] = int(m[1] * 1000)
-                    self.var_status.set(m[2])
+                    txt = m[2]
+                    el = time.time() - getattr(self, 'run_t0', time.time())
+                    if m[1] > 0.1 and el > 20:             # 進度一成以後才估，比較準
+                        left = el * (1 - m[1]) / m[1]
+                        txt += '\n已經 %d 分鐘，預估還要約 %d 分鐘。' % (el // 60, max(1, round(left / 60)))
+                    self.var_status.set(txt)
                 elif kind == 'scan':
                     _, f, r = m
                     f['osd'] = r
                     f['state'] = ''
-                    self.refresh_files()
+                    # 只更新這一列（不要整個清單重畫，影片多時才不會越來越慢）
+                    i = next((k for k, x in enumerate(self.files) if x is f), None)
+                    if i is not None and self.tv_files.exists(str(i)):
+                        vals, tag = self._row(f)
+                        self.tv_files.item(str(i), values=vals, tags=tag)
+                    if not self.scan_queue:
+                        self.update_count()
                 elif kind == 'scan_done':
                     if self.scan_queue:
                         self._start_scanner()
@@ -1017,6 +1130,35 @@ class App:
             return
         self.set_dirty(False)
         messagebox.showinfo(APP, '已儲存：\n%s' % os.path.join(self.result_dir, '列車通過紀錄.xlsx'))
+
+    def export_noise(self):
+        """噪音分析程式用的記事本檔：日期,進入時間,離開時間,10,FR,,A（只含「是列車」的）"""
+        if not self.result_dir or not self.events:
+            messagebox.showinfo(APP, '還沒有結果。')
+            return
+        valid = [e for e in self.events if e.get('valid')]
+        if not valid:
+            messagebox.showinfo(APP, '沒有判定為列車的事件，不需要輸出。')
+            return
+        unchecked = sum(1 for e in valid if e.get('need_check') and not e.get('checked'))
+        if unchecked and not self.confirm('確認', '還有 %d 筆「需人工確認」還沒勾「已人工確認」。\n\n'
+                                          '這些也會照目前的時間輸出。確定要輸出嗎？' % unchecked, ok='照樣輸出', warn=True):
+            return
+        path = filedialog.asksaveasfilename(title='儲存噪音分析用的記事本檔', initialdir=self.result_dir,
+                                            initialfile='列車進入及離開時間.txt', defaultextension='.txt',
+                                            filetypes=[('記事本', '*.txt')])
+        if not path:
+            return
+        try:
+            n = export.write_noise_txt(path, self.events)
+        except PermissionError:
+            messagebox.showerror(APP, '無法寫入，檔案可能正開著。請先關閉再試一次。')
+            return
+        except Exception as ex:
+            messagebox.showerror(APP, '輸出失敗：%s' % ex)
+            return
+        note = '（第 2 頁的修改還沒按「儲存修改並重新輸出 Excel」，但這份 TXT 已經是修改後的時間。）' if self.dirty else ''
+        messagebox.showinfo(APP, '已輸出 %d 筆列車：\n%s\n\n已排除（非列車）的沒有輸出。%s' % (n, path, note))
 
     def open_results(self):
         if self.dirty and not self.confirm('確認', '目前的結果有修改還沒儲存，開啟別的結果會放棄這些修改。\n\n確定要繼續嗎？', ok='確定', warn=True):

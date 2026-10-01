@@ -49,6 +49,77 @@ def make_video(path, seconds=40.0, trains=((5.0, +1), (22.0, -1)), speed=120.0, 
     return [(t0, t0 + length / speed, d) for t0, d in trains]   # 預期 (車頭到達, 車尾離開, 方向)
 
 
+def make_scene(path, seconds, trains=(), exposure=(), blobs=(), seed=2):
+    """較完整的假影片（驗收測試用）。
+    trains：dict(t0=車頭碰到參考線 x=350 的秒數, d=+1 往右／-1 往左, speed=像素／秒, length=車長像素,
+                 y=(上, 下), stops=[(開始停的秒數, 停多久), …], car=每節車廂長, gap=車廂間空隙像素)
+    exposure：[(開始秒, 結束秒, 亮度倍率)]（整個畫面一起變亮／變暗，模擬攝影機自動調亮度）
+    blobs：[(開始秒, 結束秒, x, y, 半徑)]（亮光，模擬車燈照射）
+    回傳每列車預期的 (車頭到達, 車尾離開)"""
+    import cv2
+    rng = np.random.default_rng(seed)
+    bg = np.full((H, W, 3), 110, np.uint8)
+    bg[:, :, 1] = 130
+    for _ in range(400):
+        x, y = rng.integers(0, W), rng.integers(0, H)
+        cv2.circle(bg, (int(x), int(y)), int(rng.integers(2, 8)), tuple(int(v) for v in rng.integers(40, 200, 3)), -1)
+    wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'MJPG'), FPS, (W, H))
+    if not wr.isOpened():
+        raise RuntimeError('無法建立測試影片')
+
+    def moved(tr, t):
+        """t 秒時車頭已經走了多少秒（扣掉停車時間）；以車頭碰到參考線為 0"""
+        m = t - tr['t0']
+        for a, dur in tr.get('stops', ()):
+            if t > a:
+                m -= min(dur, t - a)
+        return m
+    expect = []
+    for tr in trains:
+        stop_total = sum(d for _a, d in tr.get('stops', ()))
+        expect.append((tr['t0'], tr['t0'] + tr.get('length', 260) / tr.get('speed', 120.0) + stop_total))
+    for i in range(int(seconds * FPS)):
+        t = i / FPS
+        fr = bg.copy()
+        for tr in trains:
+            d, sp, ln = tr.get('d', 1), tr.get('speed', 120.0), tr.get('length', 260)
+            y0, y1 = tr.get('y', (168, 214))
+            head = 350 + d * moved(tr, t) * sp
+            car, gap = tr.get('car', ln), tr.get('gap', 0)
+            k = 0.0
+            while k < ln:                                # 一節一節畫（車廂之間留空隙）
+                a_, b_ = head - d * k, head - d * min(ln, k + car)
+                x0, x1 = sorted((int(a_), int(b_)))
+                if x1 >= 0 and x0 < W:
+                    cv2.rectangle(fr, (max(0, x0), y0), (min(W - 1, x1), y1), (230, 230, 235), -1)
+                    for wx in range(x0 + 10, x1 - 24, 30):       # 車窗跟著車身移動（座標從車廂算，不從畫面邊緣算）
+                        if -14 < wx < W:
+                            cv2.rectangle(fr, (wx, y0 + 8), (wx + 14, y0 + 20), (40, 40, 60), -1)
+                k += car + gap
+        for a_, b_, x, y, r in blobs:
+            if a_ <= t <= b_:
+                cv2.circle(fr, (x, y), r, (255, 255, 255), -1)
+        f = 1.0
+        for a_, b_, fac in exposure:
+            if a_ <= t <= b_:
+                f = fac
+        out = fr.astype(np.float32) * f + rng.normal(0, 2.5, fr.shape)
+        wr.write(np.clip(out, 0, 255).astype(np.uint8))
+    wr.release()
+    return expect
+
+
+def run_scene(path, seconds, **kw):
+    """產生場景並用正式流程判讀；回傳 (有效事件[(開始, 結束, 方向, 備註)], 預期)"""
+    expect = make_scene(path, seconds, **kw)
+    prof = core.Profile()
+    base = dt.datetime(2026, 1, 1, 8, 0, 0).timestamp()
+    evs = core.number_events(core.process([path], [base], prof))
+    got = [(round(e['start'] - base, 2), round(e['end'] - base, 2), e['direction'], e['reason'], e.get('need_check'))
+           for e in evs if e['valid']]
+    return got, expect
+
+
 def run(out_json=None):
     tmp = tempfile.mkdtemp(prefix='trainwatch_selftest_')
     vid = os.path.join(tmp, 'selftest.avi')
