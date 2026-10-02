@@ -131,6 +131,25 @@ class TestScenarios(unittest.TestCase):
         got, exp = self.run_case(30, trains=[dict(t0=5, d=1)], exposure=[(7.3, 14, 0.75)])
         self.check(got, exp, ['往右'])
 
+    def test8_local_sunlight_no_train(self):
+        """白天只有軌道一帶被陽光照亮（全畫面亮度修正抓不到）→ 不可以變成列車"""
+        got, exp = self.run_case(60, local_light=[(10, 40, 1.35)])
+        self.assertEqual(got, [])
+
+    def test8b_train_during_sunlight(self):
+        """陽光照亮期間有列車經過 → 只記列車那一段（不可以從陽光照到的時候就開始）"""
+        got, exp = self.run_case(60, trains=[dict(t0=25, d=-1)], local_light=[(10, 50, 1.35)])
+        self.check(got, exp, ['往左'])
+
+    def test8c_scene_is_daytime(self):
+        """確認假影片被當成白天（彩度夠高），上面兩個測試才有意義"""
+        import cv2
+        d = tempfile.mkdtemp(); f = os.path.join(d, 's.avi')
+        selftest.make_scene(f, 2)
+        ok, fr = cv2.VideoCapture(f).read()
+        sat = float(cv2.cvtColor(fr, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+        self.assertGreater(sat, core.Profile().day_saturation)
+
     def test_shots_cancel(self):
         """產生截圖與短片時按取消，要真的停下來"""
         d = tempfile.mkdtemp()
@@ -195,6 +214,31 @@ class TestGuiHelpers(unittest.TestCase):
         self.assertEqual(gui.parse_datetime('2026/01/02 08:00:00'), dt.datetime(2026, 1, 2, 8, 0, 0))
         with self.assertRaises(ValueError):
             gui.parse_hms('25:00:00')
+
+    def test_result_location(self):
+        """結果統一放進「判讀結果」資料夾；預設在影片旁邊；選的資料夾本身叫「判讀結果」時不再多包一層；預設位置存得起來"""
+        try:
+            from trainwatch import gui
+        except Exception as e:
+            self.skipTest(str(e))
+        import tempfile
+        v = os.path.join('D:', os.sep, '錄影', 'a.mkv')
+        self.assertEqual(gui.result_root(None, v), os.path.join('D:', os.sep, '錄影', '判讀結果'))
+        self.assertEqual(gui.result_root(os.path.join('E:', os.sep, '報告'), v), os.path.join('E:', os.sep, '報告', '判讀結果'))
+        self.assertEqual(gui.result_root(os.path.join('E:', os.sep, '判讀結果'), v), os.path.join('E:', os.sep, '判讀結果'))
+        with tempfile.TemporaryDirectory() as d:
+            old = os.environ.get('TRAINWATCH_HOME')
+            os.environ['TRAINWATCH_HOME'] = d
+            try:
+                self.assertEqual(gui.load_settings(), {})
+                self.assertTrue(gui.save_settings({'result_location': os.path.join(d, '報告')}))
+                self.assertEqual(gui.load_settings()['result_location'], os.path.join(d, '報告'))
+                self.assertTrue(os.path.exists(os.path.join(d, '程式設定.json')))
+            finally:
+                if old is None:
+                    os.environ.pop('TRAINWATCH_HOME')
+                else:
+                    os.environ['TRAINWATCH_HOME'] = old
 
 
 def _expected():

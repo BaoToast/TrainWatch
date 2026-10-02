@@ -50,6 +50,8 @@ class Profile:
     long_event: float = 600.0             # 超過幾秒只標記「需人工確認」（不會因此結束，也不會重學背景）
     static_motion: float = 2.5            # 參考線上前後兩格的變化小於此值 → 視為畫面靜止（列車停住）
     static_sec: float = 3.0               # 佔用中靜止超過幾秒 → 備註「列車曾停止」（只記錄，不結束事件）
+    day_saturation: float = 25.0          # 畫面彩度高於此值＝白天（夜間紅外線模式是黑白，彩度接近 0）
+    light_ncc: float = 0.45               # 白天：參考線附近和背景的紋理相似度高於此值 → 只是光線變亮／變暗（陽光、雲影），不是列車
     max_static: float = 1800.0            # 佔用中「完全靜止」超過幾秒才放棄等待：在最後有動靜的時間結束並標需確認
                                           # （防止攝影機被撞歪、畫面永久改變時，整天變成一筆）
     clip_before: float = 3.0              # 短片：事件前幾秒
@@ -106,6 +108,9 @@ class Detector:
         cv2.line(m, (int(xa - self.cx0), int(ya - self.cy0)), (int(xb - self.cx0), int(yb - self.cy0)), 255,
                  max(1, int(profile.ref_width)))
         self.ref_mask = m > 0
+        # 紋理比對用：參考線左右各加寬 10 像素的帶狀區域
+        self.band = cv2.dilate(m, np.ones((1, 21), np.uint8)) > 0
+        self.light_since = None   # 白天「只是光線變化」從什麼時候開始
         x0, y0, x1, y1 = profile.track_rect
         self.tr = (int(min(x0, x1) - self.cx0), int(min(y0, y1) - self.cy0),
                    int(max(x0, x1) - self.cx0), int(max(y0, y1) - self.cy0))
@@ -155,6 +160,20 @@ class Detector:
 
         on = score > self.p.on_level
         occupied = score > (self.p.off_level if (self.cur is not None and self.pending_close is None) else self.p.on_level)
+        # 白天：亮度差很多、但紋理和背景幾乎一樣（地上的東西都還在原位，只是被陽光照亮或雲遮暗）→ 不算有車。
+        # 夜間（紅外線黑白畫面）列車被車燈照白時紋理相似度也很高，所以只在白天用。
+        light = False
+        if sat >= self.p.day_saturation and score > self.p.off_level:
+            u = g[self.band]; v = self.bg[self.band]
+            u = u - u.mean(); v = v - v.mean()
+            ncc = float((u * v).sum() / np.sqrt((u * u).sum() * (v * v).sum() + 1e-6))
+            light = ncc > self.p.light_ncc
+        if light:
+            on = occupied = False
+            if self.light_since is None:
+                self.light_since = t_abs
+        else:
+            self.light_since = None
         if self.cur is None:
             if on:
                 self.cur = dict(at_file_start=(self.first_t is not None and t_abs - self.first_t < 2.0),start=t_abs, start_file=file, start_pos=pos, end=t_abs, end_file=file, end_pos=pos,
@@ -206,6 +225,13 @@ class Detector:
         # 背景更新：沒有事件時一律學習（畫面某處永久改變時才不會一直卡在「有點不一樣」）；
         # 事件進行中（含列車停住的時候）完全凍結，停著的列車不會被學成背景。光線變化交給亮度修正（_exposure）處理。
         if self.cur is not None:
+            return
+        if self.light_since is not None and t_abs - self.light_since >= 1.0:
+            # 光線變化持續 1 秒：直接把現在的畫面當新背景（不然要好幾分鐘才學得完，期間來的列車會判不準）
+            self.bg = g * gain
+            if self.small is not None:
+                self.bg_small = self.small.copy()
+            self.light_since = None
             return
         # 沒有事件時：和背景差很多的像素（例如列車已經進入軌道範圍、還沒碰到參考線）只用很慢的速度學，
         # 慢速列車才不會在碰到參考線之前就被學進背景；其他像素照常學（光線、天色變化）
@@ -635,6 +661,78 @@ def open_at(path, t, near=3.0):
             if cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0 >= t - near:
                 break
     return cap
+
+
+def jump_near(path, t, cancel=None, near=4.0, tries=6):
+    """跳轉不可靠的影片（檔頭每秒格數和實際不同）：每次用新開的影片試跳，
+    依「要求的位置 → 實際落點」的比例修正下一次的要求，通常 2～3 次就落在 t 之前 near 秒內。
+    回傳停在 t 之前的影片（接著依序讀到 t）；都不成功時回傳落點在 t 之前最接近的一次（最差是從頭）。"""
+    best_cap, best_p = cv2.VideoCapture(path), 0.0
+    x, ratio = t - near / 2, 1.0
+    for _ in range(tries):
+        if cancel and cancel():
+            break
+        cap = cv2.VideoCapture(path)
+        cap.set(cv2.CAP_PROP_POS_MSEC, max(0.0, x) * 1000)
+        ok = cap.grab()
+        p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+        if ok and p <= t and p > best_p:
+            best_cap.release()
+            best_cap, best_p = cap, p
+            if t - p <= near:
+                return best_cap
+        else:
+            cap.release()
+        if ok and p > 0 and x > 0:
+            ratio = p / x
+        else:
+            ratio *= 1.5                 # 讀不到（跳太後面）：要求往前一點
+        x = (t - near / 2) / ratio
+    return best_cap
+
+
+class PreviewReader:
+    """預覽用：記住目前開著的影片與位置。往後看（+1 秒、往右拖）時接著讀，不用每次從頭；
+    往回看或換影片才重新開。cancel() 讓讀到一半的工作停下來（使用者又拖了別的位置）。
+    回傳 (frame, 實際秒數) 或 (None, 0.0)。progress(已讀秒數, 目標秒數) 給畫面顯示「讀取中」。"""
+
+    def __init__(self):
+        self.cap = None
+        self.path = None
+        self.pos = -1.0          # 下一次 grab 之前，上一格的時間
+
+    def close(self):
+        if self.cap is not None:
+            self.cap.release()
+        self.cap, self.path, self.pos = None, None, -1.0
+
+    def read(self, path, t, cancel=None, progress=None):
+        if self.cap is None or path != self.path or t < self.pos - 0.05 or (path not in _BAD_SEEK and t - self.pos > 6):
+            self.close()
+            if t <= 3.0:
+                self.cap = cv2.VideoCapture(path)
+            elif path in _BAD_SEEK:
+                self.cap = jump_near(path, t, cancel)
+            else:
+                self.cap = open_at(path, t)   # 跳轉可靠的影片：直接跳（若跳錯會被記成 _BAD_SEEK 並從頭讀）
+            self.path, self.pos = path, -1.0
+        cap = self.cap
+        n = 0
+        while True:
+            if not cap.grab():
+                self.close()
+                return None, 0.0
+            p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+            self.pos = p
+            if p >= t - 0.05:
+                ok, fr = cap.retrieve()
+                return (fr, p) if ok else (None, 0.0)
+            n += 1
+            if n % 30 == 0:
+                if cancel and cancel():
+                    return None, 0.0
+                if progress:
+                    progress(p, t)
 
 
 def read_frame_at(path, t):

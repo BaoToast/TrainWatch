@@ -19,12 +19,15 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.4'
+VERSION = '1.0.7'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
-CANVAS_W, CANVAS_H = 900, 506
-MAX_FILES = 300            # 一次最多加入幾支影片（10 分鐘一支約 2 天）；清單和判讀都還順，再多建議分批
+CANVAS_W, CANVAS_H = 900, 506      # 第 1 頁影片畫面的「建議」大小；實際大小跟著視窗縮放
+# 每一頁內容的最小尺寸：視窗比這個小時出現捲軸，內容不會被切掉（v1.0.7）
+TAB_MIN = {1: (0, 0), 2: (0, 0)}       # 0＝依內容實際需要的大小
+MAX_FILES = 300            # 一次最多加入幾支影片
+MAX_HOURS = 48.0           # 一次最多判讀幾小時的影片（總時數；影片長短不一時以這個為準）
 SEC_PER_VIDEO_MIN = (1.0, 2.0)   # 預估：每 1 分鐘影片判讀約需幾秒（快的電腦～慢的電腦）
 
 # 進階設定的合理範圍（超出範圍不給存）
@@ -41,6 +44,106 @@ def app_dir():
     if getattr(sys, 'frozen', False):
         return os.path.dirname(sys.executable)
     return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+RESULT_FOLDER = '判讀結果'
+STATUS_EMPTY = '請先加入影片，再在右邊畫參考線與軌道範圍。'
+STATUS_READY = '影片已加入。畫好框線後，按「開始判讀」。'
+
+
+def settings_path():
+    """程式設定（目前只有結果存放的預設位置）。程式資料夾不能寫入時改存到使用者資料夾"""
+    return os.path.join(app_dir(), '程式設定.json')
+
+
+def load_settings():
+    for p in (settings_path(), os.path.join(os.path.expanduser('~'), '列車通過判讀_程式設定.json')):
+        try:
+            with open(p, encoding='utf-8') as fh:
+                d = json.load(fh)
+            if isinstance(d, dict):
+                return d
+        except (OSError, ValueError):
+            pass
+    return {}
+
+
+def save_settings(d):
+    txt = json.dumps(d, ensure_ascii=False, indent=2)
+    for p in (settings_path(), os.path.join(os.path.expanduser('~'), '列車通過判讀_程式設定.json')):
+        try:
+            with open(p, 'w', encoding='utf-8') as fh:
+                fh.write(txt)
+            return True
+        except OSError:
+            continue
+    return False
+
+
+def result_root(location, first_video):
+    """「判讀結果」資料夾的位置。location＝None 表示放在（第一支）影片旁邊；
+    使用者選的資料夾本身就叫「判讀結果」時直接用，不再多包一層"""
+    base = location or os.path.dirname(os.path.abspath(first_video))
+    if os.path.basename(os.path.normpath(base)) == RESULT_FOLDER:
+        return base
+    return os.path.join(base, RESULT_FOLDER)
+
+
+class ScrollArea(ttk.Frame):
+    """可捲動的分頁容器：視窗夠大時內容跟著視窗伸縮；比 min_w×min_h 小時，內容維持最小尺寸並出現捲軸"""
+    def __init__(self, master, min_w, min_h):
+        super().__init__(master)
+        self.min_w, self.min_h = min_w, min_h
+        bg = ttk.Style(self).lookup('TFrame', 'background') or '#dcdad5'
+        self.cv = tk.Canvas(self, highlightthickness=0, bd=0, bg=bg)
+        self.vs = ttk.Scrollbar(self, orient='vertical', command=self.cv.yview)
+        self.hs = ttk.Scrollbar(self, orient='horizontal', command=self.cv.xview)
+        self.cv.configure(yscrollcommand=self.vs.set, xscrollcommand=self.hs.set)
+        self.cv.grid(row=0, column=0, sticky='nsew')
+        self.rowconfigure(0, weight=1); self.columnconfigure(0, weight=1)
+        self.inner = ttk.Frame(self.cv)
+        self._win = self.cv.create_window(0, 0, window=self.inner, anchor='nw')
+        self.cv.bind('<Configure>', lambda e: self._fit())
+        self._last = None
+        self.after(400, self._watch)
+
+    def _watch(self):
+        try:
+            self._fit()
+            self.after(400, self._watch)
+        except tk.TclError:
+            pass
+
+    def _fit(self):
+        cw, ch = self.cv.winfo_width(), self.cv.winfo_height()
+        if cw <= 1:
+            return
+        mw = max(self.min_w, self.inner.winfo_reqwidth())
+        mh = max(self.min_h, self.inner.winfo_reqheight())
+        key = (cw, ch, mw, mh)
+        if key == self._last:
+            return
+        self._last = key
+        w, h = max(cw, mw), max(ch, mh)
+        self.cv.itemconfigure(self._win, width=w, height=h)
+        self.cv.configure(scrollregion=(0, 0, w, h))
+        for sb, need, kw in ((self.vs, ch < mh, dict(row=0, column=1, sticky='ns')),
+                             (self.hs, cw < mw, dict(row=1, column=0, sticky='ew'))):
+            if need:
+                sb.grid(**kw)
+            else:
+                sb.grid_remove()
+        if ch >= mh:
+            self.cv.yview_moveto(0)
+        if cw >= mw:
+            self.cv.xview_moveto(0)
+
+    def wheel(self, units, horizontal=False):
+        if horizontal:
+            if self.hs.winfo_ismapped():
+                self.cv.xview_scroll(units, 'units')
+        elif self.vs.winfo_ismapped():
+            self.cv.yview_scroll(units, 'units')
 
 
 def open_path(p):
@@ -93,6 +196,8 @@ class App:
         self.run_files, self.run_timing = [], []
         self.run_profile = None
         self.dirty = False          # 第 2 頁有修改還沒儲存
+        self._pv_token = 0          # 預覽：每次要求一個新畫面就加一，舊的讀取看到號碼變了就停下來
+        self._pv_shown = None
         self.q = queue.Queue()
         self.cancel_flag = False
         self.worker = None
@@ -106,6 +211,10 @@ class App:
         self._seek_job = None
         self.mode = tk.StringVar(value='ref')
         self.show_excluded = tk.BooleanVar(value=False)
+        self.settings = load_settings()
+        d = self.settings.get('result_location')
+        self.out_default = d if isinstance(d, str) and d else None   # None＝影片旁邊
+        self.out_location = self.out_default                            # 這次要用的位置
         self.prof_dir = os.path.join(app_dir(), '監測站設定')
         try:
             os.makedirs(self.prof_dir, exist_ok=True)
@@ -115,16 +224,35 @@ class App:
 
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill='both', expand=True, padx=6, pady=6)
-        self.tab1 = ttk.Frame(self.nb)
-        self.tab2 = ttk.Frame(self.nb)
-        self.nb.add(self.tab1, text='  1. 影片與參考線  ')
-        self.nb.add(self.tab2, text='  2. 檢視與修改結果  ')
+        self.page1 = ScrollArea(self.nb, *TAB_MIN[1])
+        self.page2 = ScrollArea(self.nb, *TAB_MIN[2])
+        self.tab1, self.tab2 = self.page1.inner, self.page2.inner
+        self.nb.add(self.page1, text='  1. 影片與參考線  ')
+        self.nb.add(self.page2, text='  2. 檢視與修改結果  ')
+        for seq in ('<MouseWheel>', '<Shift-MouseWheel>', '<Button-4>', '<Button-5>'):
+            root.bind_all(seq, self._on_wheel, add='+')
         self._build_tab1()
         self.update_count()
         self._build_tab2()
         self._load_last_profile()
         root.protocol('WM_DELETE_WINDOW', self.on_close)
         root.after(150, self._poll)
+
+    def _on_wheel(self, e):
+        """滑鼠滾輪捲動整頁（只有視窗太小、出現捲軸時）。在清單上滾動仍是捲清單"""
+        try:
+            if isinstance(e.widget, (ttk.Treeview, tk.Listbox, ttk.Combobox, ttk.Spinbox, ttk.Scale)):
+                return
+            page = self.page1 if self.nb.select() == str(self.page1) else self.page2
+            if not str(e.widget).startswith(str(page)):
+                return
+        except (tk.TclError, AttributeError, KeyError):
+            return
+        if getattr(e, 'num', None) in (4, 5):
+            units = -1 if e.num == 4 else 1
+        else:
+            units = -1 if e.delta > 0 else 1
+        page.wheel(units * 3, horizontal=bool(e.state & 0x1))
 
     # ------------------------------------------------------------ 外觀
     def _fonts(self):
@@ -154,9 +282,9 @@ class App:
     # ------------------------------------------------------------ 分頁 1
     def _build_tab1(self):
         t = self.tab1
-        left = ttk.Frame(t, width=360)
+        left = ttk.Frame(t)
         left.pack(side='left', fill='y', padx=(4, 8), pady=4)
-        left.pack_propagate(False)
+        ttk.Frame(left, width=360, height=1).pack(side='bottom')   # 撐住寬度 360（不用 pack_propagate，高度才算得出來）
         right = ttk.Frame(t)
         right.pack(side='left', fill='both', expand=True, pady=4)
 
@@ -173,7 +301,7 @@ class App:
         ttk.Button(r, text='儲存', width=5, command=self.save_profile).pack(side='left', padx=(4, 0))
         ttk.Button(r, text='進階…', width=6, command=self.advanced).pack(side='left', padx=(4, 0))
 
-        box = ttk.LabelFrame(left, text='影片（同一台攝影機）')
+        box = vbox = ttk.LabelFrame(left, text='影片（同一台攝影機）')
         box.pack(fill='both', expand=True, pady=(0, 6))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 2))
         ttk.Button(r, text='加入影片…', command=self.add_files).pack(side='left')
@@ -181,7 +309,7 @@ class App:
         ttk.Button(r, text='清空', width=5, command=self.clear_files).pack(side='left', padx=(4, 0))
         ttk.Button(r, text='依時間排序', command=self.sort_files).pack(side='left', padx=(4, 0))
         fr = ttk.Frame(box); fr.pack(fill='both', expand=True, padx=6, pady=2)
-        self.tv_files = ttk.Treeview(fr, columns=('name', 'start'), show='headings', selectmode='extended', height=6)
+        self.tv_files = ttk.Treeview(fr, columns=('name', 'start'), show='headings', selectmode='extended', height=2)
         self.tv_files.heading('name', text='檔名'); self.tv_files.heading('start', text='畫面上的開始時間')
         self.tv_files.column('name', width=150, anchor='w'); self.tv_files.column('start', width=160, anchor='center')
         sb = ttk.Scrollbar(fr, orient='vertical', command=self.tv_files.yview)
@@ -191,28 +319,39 @@ class App:
         self.tv_files.tag_configure('manual', foreground='#0050a0')
         self.tv_files.bind('<<TreeviewSelect>>', lambda e: self.on_file_select())
         self.var_count = tk.StringVar(value='')
-        ttk.Label(box, textvariable=self.var_count, foreground='#1060c0', wraplength=330, justify='left').pack(fill='x', padx=6)
-        ttk.Label(box, style='Hint.TLabel', wraplength=330, justify='left', text=(
-            '開始時間是讀畫面上的時間字幕，不看檔名。讀不到（紅字）時請選取該檔，'
-            '在下面填畫面時間；藍字＝手動填的。')).pack(fill='x', padx=6)
-        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(4, 2))
-        ttk.Label(r, text='手動開始時間').pack(side='left')
-        self.var_ftime = tk.StringVar()
-        ttk.Entry(r, textvariable=self.var_ftime).pack(side='left', fill='x', expand=True, padx=(6, 0))
-        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(2, 6))
-        ttk.Label(r, text='例：2026-01-01 08:00:00', style='Hint.TLabel').pack(side='left')
+        self.lbl_count = ttk.Label(box, textvariable=self.var_count, foreground='#1060c0', wraplength=330, justify='left')
+        self.lbl_count.pack(fill='x', padx=6)
+        hint = ttk.Label(box, style='Hint.TLabel', wraplength=330, justify='left', text=(
+            '開始時間讀畫面上的字幕（不看檔名）。紅字＝讀不到，請選取該檔在下面填；藍字＝手動填的。'))
+        hint.pack(fill='x', padx=6)
+        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(4, 6))
+        lr = ttk.Frame(r); lr.pack(side='top', fill='x')
+        ttk.Label(lr, text='手動開始時間').pack(side='left')
+        ttk.Label(lr, text='例：2026-01-01 08:00:00', style='Hint.TLabel').pack(side='left', padx=(8, 0))
         ttk.Button(r, text='清除', width=5, command=self.clear_file_time).pack(side='right')
-        ttk.Button(r, text='套用', width=5, command=self.set_file_time).pack(side='right', padx=(0, 4))
+        ttk.Button(r, text='套用', width=5, command=self.set_file_time).pack(side='right', padx=(4, 4))
+        self.var_ftime = tk.StringVar()
+        ttk.Entry(r, textvariable=self.var_ftime).pack(side='left', fill='x', expand=True)
+        # 清單下面這幾行先排（由下往上），視窗矮的時候縮的是影片清單，不會把手動時間那一行擠掉
+        for w in (r, hint, self.lbl_count):
+            w.pack_configure(side='bottom', before=fr)
 
         box = ttk.LabelFrame(left, text='判讀')
-        box.pack(fill='x')
-        self.btn_run = ttk.Button(box, text='開始判讀', style='Big.TButton', command=self.start_run)
-        self.btn_run.pack(fill='x', padx=6, pady=(8, 4))
-        self.btn_cancel = ttk.Button(box, text='取消', command=self.cancel_run, state='disabled')
-        self.btn_cancel.pack(fill='x', padx=6)
+        box.pack(fill='x', side='bottom', before=vbox)   # 先排，視窗小時縮的是影片清單，不是判讀按鈕與狀態
+        self.var_outloc = tk.StringVar()
+        ttk.Label(box, textvariable=self.var_outloc, foreground='#1060c0', wraplength=330, justify='left').pack(fill='x', padx=6, pady=(4, 0))
+        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(2, 0))
+        ttk.Button(r, text='選擇存放位置…', command=self.choose_out_location).pack(side='left')
+        ttk.Button(r, text='改回影片旁邊', command=self.reset_out_location).pack(side='left', padx=(4, 0))
+        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
+        self.btn_cancel = ttk.Button(r, text='取消', width=6, command=self.cancel_run, state='disabled')
+        self.btn_cancel.pack(side='right', fill='y', padx=(4, 0))
+        self.btn_run = ttk.Button(r, text='開始判讀', style='Big.TButton', command=self.start_run)
+        self.btn_run.pack(side='left', fill='x', expand=True)
+        self.update_out_location()
         self.pb = ttk.Progressbar(box, maximum=1000)
         self.pb.pack(fill='x', padx=6, pady=(6, 2))
-        self.var_status = tk.StringVar(value='請先加入影片，再在右邊畫參考線與軌道範圍。')
+        self.var_status = tk.StringVar(value=STATUS_EMPTY)
         ttk.Label(box, textvariable=self.var_status, wraplength=330, style='Hint.TLabel').pack(fill='x', padx=6, pady=(0, 8))
 
         r = ttk.Frame(right); r.pack(fill='x')
@@ -220,67 +359,87 @@ class App:
         ttk.Radiobutton(r, text='參考線（紅）', value='ref', variable=self.mode).pack(side='left', padx=3)
         ttk.Radiobutton(r, text='軌道範圍（橘）', value='track', variable=self.mode).pack(side='left', padx=3)
         ttk.Radiobutton(r, text='時間字幕位置（藍）', value='osd', variable=self.mode).pack(side='left', padx=3)
-        ttk.Label(r, text='線寬').pack(side='left', padx=(10, 2))
-        self.var_width = tk.IntVar(value=self.profile.ref_width)
-        sp = ttk.Spinbox(r, from_=3, to=25, width=4, textvariable=self.var_width, command=self.redraw_overlay)
-        sp.pack(side='left')
-        sp.bind('<KeyRelease>', lambda e: self.redraw_overlay())
 
-        self.canvas = tk.Canvas(right, width=CANVAS_W, height=CANVAS_H, bg='#202020', highlightthickness=0, cursor='crosshair')
-        self.canvas.pack(pady=(6, 4), anchor='w')
+        self.cw, self.ch = CANVAS_W, CANVAS_H
+        self.canvas = tk.Canvas(right, width=480, height=270, bg='#202020', highlightthickness=0, cursor='crosshair')
+        self.canvas.bind('<Configure>', self._on_canvas_size)
         self.canvas.bind('<ButtonPress-1>', self.on_press)
         self.canvas.bind('<B1-Motion>', self.on_drag)
         self.canvas.bind('<ButtonRelease-1>', self.on_release)
 
+        # 畫面下面的列先排（由下往上），影片畫面拿剩下的空間，視窗縮小時縮的是畫面
+        below = ttk.Frame(right); below.pack(side='bottom', fill='x')
+        self.canvas.pack(side='top', fill='both', expand=True, pady=(6, 4), anchor='nw')
+        right = below
         r = ttk.Frame(right); r.pack(fill='x')
         self.var_pos = tk.DoubleVar(value=0)
         self.scale = ttk.Scale(r, from_=0, to=600, variable=self.var_pos, command=lambda v: self.schedule_seek())
         self.scale.pack(side='left', fill='x', expand=True)
         self.var_postxt = tk.StringVar(value='影片內 --:--')
-        ttk.Label(r, textvariable=self.var_postxt, width=14, anchor='e').pack(side='left', padx=(8, 0))
+        ttk.Label(r, textvariable=self.var_postxt, width=18, anchor='e').pack(side='left', padx=(8, 0))
         r = ttk.Frame(right); r.pack(fill='x', pady=(2, 0))
         for lab, d in (('−10 秒', -10), ('−1 秒', -1), ('+1 秒', 1), ('+10 秒', 10)):
             ttk.Button(r, text=lab, width=7, command=lambda d=d: self.step(d)).pack(side='left', padx=(0, 4))
-        ttk.Label(r, text='　畫面時間判讀：').pack(side='left')
+        ttk.Label(r, text='線寬').pack(side='left', padx=(10, 2))
+        self.var_width = tk.IntVar(value=self.profile.ref_width)
+        sp = ttk.Spinbox(r, from_=3, to=25, width=4, textvariable=self.var_width, command=self.redraw_overlay)
+        sp.pack(side='left')
+        sp.bind('<KeyRelease>', lambda e: self.redraw_overlay())
+        ttk.Button(r, text='教程式認字…', command=self.teach_osd).pack(side='right')
+        r = ttk.Frame(right); r.pack(fill='x', pady=(4, 0))     # 時間判讀單獨一行，視窗窄時不會擠掉按鈕
+        ttk.Label(r, text='畫面時間判讀：').pack(side='left')
         self.var_osd = tk.StringVar(value='')
         self.lbl_osd = ttk.Label(r, textvariable=self.var_osd, style='Ok.TLabel')
         self.lbl_osd.pack(side='left')
-        ttk.Button(r, text='教程式認字…', command=self.teach_osd).pack(side='right')
         hints = ttk.Frame(right); hints.pack(fill='x', pady=(8, 0))
+        self._hint_labels = []
         for title, color, text in (
                 ('參考線', '#c00000', '畫一條橫過軌道的短線。車頭碰到線＝到達時間，車尾離開線＝離開時間。不用剛好畫到車身高度，蓋住兩條軌道即可。'),
                 ('軌道範圍', '#b06000', '沿著軌道框一段，參考線左右都要留一段。用來分辨列車（佔滿一長段軌道、橫跨參考線）和汽車、行人、車燈，請盡量避開馬路。'),
                 ('時間字幕位置', '#1060c0', '框住畫面上的日期時間字幕（第一個字的左邊到最後一個字的右邊）。下方「畫面時間判讀」和畫面上一樣就表示讀得到；不一樣請調整藍框，或按「教程式認字」。')):
             row = ttk.Frame(hints); row.pack(fill='x', pady=1)
             tk.Label(row, text=title, fg=color, font=(self.font_family, 10, 'bold'), width=12, anchor='nw').pack(side='left', anchor='n')
-            ttk.Label(row, text=text, style='Hint.TLabel', wraplength=780, justify='left').pack(side='left', fill='x')
+            lb = ttk.Label(row, text=text, style='Hint.TLabel', wraplength=780, justify='left')
+            lb.pack(side='left', fill='x')
+            self._hint_labels.append(lb)
+        hints.bind('<Configure>', lambda e: [lb.configure(wraplength=max(200, e.width - 110)) for lb in self._hint_labels])
 
     # ------------------------------------------------------------ 分頁 2
     def _build_tab2(self):
         t = self.tab2
         top = ttk.Frame(t); top.pack(fill='x', padx=4, pady=(4, 4))
         ttk.Button(top, text='開啟先前的結果…', command=self.open_results).pack(side='left')
-        ttk.Checkbutton(top, text='顯示已排除（非列車／閃爍）', variable=self.show_excluded,
-                        command=self.fill_events).pack(side='left', padx=12)
-        self.var_sum = tk.StringVar(value='')
-        ttk.Label(top, textvariable=self.var_sum).pack(side='left', padx=8)
         ttk.Button(top, text='開啟結果資料夾', command=lambda: self.result_dir and open_path(self.result_dir)).pack(side='right')
         ttk.Button(top, text='輸出噪音分析用 TXT', command=self.export_noise).pack(side='right', padx=(6, 6))
         ttk.Button(top, text='儲存修改並重新輸出 Excel', style='Big.TButton', command=self.save_results).pack(side='right', padx=6)
 
+        # 第二行：顯示已排除、筆數、提示訊息（提示太長會自動換行，不會把按鈕擠掉）
+        r2 = ttk.Frame(t); r2.pack(fill='x', padx=4, pady=(0, 4))
+        ttk.Checkbutton(r2, text='顯示已排除（非列車／閃爍）', variable=self.show_excluded,
+                        command=self.fill_events).pack(side='left', anchor='n')
+        self.var_sum = tk.StringVar(value='')
+        ttk.Label(r2, textvariable=self.var_sum).pack(side='left', padx=(12, 0), anchor='n')
+        self.var_tab2msg = tk.StringVar(value='')
+        msg = ttk.Label(r2, textvariable=self.var_tab2msg, foreground='#1060c0', justify='left', wraplength=400)
+        msg.pack(side='left', fill='x', expand=True, padx=(16, 0), anchor='n')
+        msg.bind('<Configure>', lambda e: msg.configure(wraplength=max(150, e.width - 4)))
         body = ttk.Frame(t); body.pack(fill='both', expand=True, padx=4)
-        rf = ttk.Frame(body, width=500); rf.pack(side='right', fill='y', padx=(8, 0))
-        rf.pack_propagate(False)
-        lf = ttk.Frame(body); lf.pack(side='left', fill='both', expand=True)
+        rf = ttk.Frame(body); rf.pack(side='right', fill='y', padx=(8, 0))
+        ttk.Frame(rf, width=500, height=1).pack(side='bottom')     # 撐住寬度 500
+        lf = ttk.Frame(body, width=420, height=200); lf.pack(side='left', fill='both', expand=True)
+        lf.pack_propagate(False)        # 清單最少 420×200，比這個窄就用清單下方的水平捲軸
         cols = ('no', 'date', 'start', 'end', 'dur', 'dir', 'type', 'cross', 'check', 'reason')
         heads = ('編號', '日期', '車頭到達', '車尾離開', '秒數', '方向', '車種', '交會', '需確認', '備註')
         widths = (46, 56, 86, 86, 46, 70, 100, 44, 56, 240)
         self.tv = ttk.Treeview(lf, columns=cols, show='headings', selectmode='browse')
         for c, h, w in zip(cols, heads, widths):
             self.tv.heading(c, text=h)
-            self.tv.column(c, width=w, anchor='w' if c in ('reason', 'type') else 'center', stretch=(c == 'reason'))
+            self.tv.column(c, width=w, minwidth=w if c == 'reason' else 20,
+                           anchor='w' if c in ('reason', 'type') else 'center', stretch=(c == 'reason'))
+        hsb = ttk.Scrollbar(lf, orient='horizontal', command=self.tv.xview)
+        hsb.pack(side='bottom', fill='x')
         sb = ttk.Scrollbar(lf, orient='vertical', command=self.tv.yview)
-        self.tv.configure(yscrollcommand=sb.set)
+        self.tv.configure(yscrollcommand=sb.set, xscrollcommand=hsb.set)
         self.tv.pack(side='left', fill='both', expand=True); sb.pack(side='left', fill='y')
         self.tv.tag_configure('need', background='#fff2cc')
         self.tv.tag_configure('excl', foreground='#666666')
@@ -319,10 +478,9 @@ class App:
         self.btn_valid = ttk.Button(r, text='改為「不是列車」', command=self.toggle_valid)
         self.btn_valid.pack(side='left', padx=6)
         for line in ('淡黃色＝需要人工確認（方向不確定、影片一開始就有車等）。',
-                     '看過後勾「已人工確認」，再按「套用修改」。',
-                     '時間格式：時:分:秒，例如「08:15:30.5」。',
+                     '看過後勾「已人工確認」，再按「套用修改」（時間例：08:15:30.5）。',
                      '修改完記得按上方「儲存修改並重新輸出 Excel」。'):
-            ttk.Label(rf, style='Hint.TLabel', text=line).pack(fill='x', pady=(2, 0))
+            ttk.Label(rf, style='Hint.TLabel', text=line).pack(fill='x', pady=(1, 0))
 
     # ------------------------------------------------------------ 監測站設定
     def _profile_names(self):
@@ -596,17 +754,29 @@ class App:
         return (os.path.basename(f['path']), txt), tag
 
     def update_count(self):
+        self.update_out_location()
         n = len(self.files)
         mins = sum(((f.get('info') or {}).get('dur') or 600) for f in self.files) / 60.0
         if n == 0:
-            self.var_count.set('最多可加入 %d 支影片。' % MAX_FILES)
+            self.var_count.set('最多可加入 %d 支、合計 %d 小時的影片。' % (MAX_FILES, MAX_HOURS))
             return
         lo, hi = (mins * k / 60.0 for k in SEC_PER_VIDEO_MIN)
         total = ('%.1f 小時' % (mins / 60)) if mins >= 60 else ('%d 分鐘' % round(mins))
-        self.var_count.set('已加入 %d 支（上限 %d 支），合計約 %s；預估判讀約 %d～%d 分鐘（依電腦速度不同）。'
-                           % (n, MAX_FILES, total, max(1, round(lo)), max(1, round(hi))))
+        pending = any(f.get('info') is None for f in self.files)
+        over = mins / 60.0 > MAX_HOURS
+        msg = '已加入 %d 支，合計%s %s' % (n, '目前約' if pending else '約', total)
+        if over:
+            msg += '\n⚠ 超過 %d 小時上限，請移除部分影片，分批判讀。' % MAX_HOURS
+        else:
+            msg += '\n上限 %d 支、%d 小時；預估約 %d～%d 分鐘' % (MAX_FILES, MAX_HOURS, max(1, round(lo)), max(1, round(hi)))
+        self.var_count.set(msg)
+        if hasattr(self, 'lbl_count'):
+            self.lbl_count.configure(foreground='#b00000' if over else '#1060c0')
 
     def refresh_files(self):
+        st = self.var_status.get() if hasattr(self, 'var_status') else None
+        if st in (STATUS_EMPTY, STATUS_READY):          # 只換掉開頭的提示，不蓋掉判讀完成等訊息
+            self.var_status.set(STATUS_READY if self.files else STATUS_EMPTY)
         sel = self.tv_files.selection()
         self.tv_files.delete(*self.tv_files.get_children())
         for i, f in enumerate(self.files):
@@ -645,23 +815,71 @@ class App:
         return self.files[int(sel[0])] if sel else None
 
     def show_frame(self):
+        """預覽在背景讀，視窗不會卡住；又拖了別的位置時，舊的讀取會停下來"""
         self._seek_job = None
         f = self._sel_file()
         if not f:
             return
-        fr, pos = core.read_frame_at(f['path'], self.var_pos.get())
+        self._pv_token = getattr(self, '_pv_token', 0) + 1
+        tok, path, t = self._pv_token, f['path'], self.var_pos.get()
+        if not hasattr(self, 'pv_reader'):
+            self.pv_reader = core.PreviewReader()
+            self.pv_lock = threading.Lock()
+
+        def prog(p, target):
+            self.q.put(('pv_prog', tok, p, target))
+
+        def work():
+            with self.pv_lock:
+                if tok != self._pv_token:
+                    return
+                try:
+                    fr, pos = self.pv_reader.read(path, t, cancel=lambda: tok != self._pv_token, progress=prog)
+                except Exception:
+                    fr, pos = None, 0.0
+            self.q.put(('pv_done', tok, fr, pos))
+        threading.Thread(target=work, daemon=True).start()
+        self.root.after(400, lambda: tok == self._pv_token and self._pv_busy(tok))
+
+    def _on_canvas_size(self, e):
+        if (e.width, e.height) == (self.cw, self.ch):
+            return
+        self.cw, self.ch = max(50, e.width), max(30, e.height)
+        if getattr(self, '_resize_job', None):
+            self.root.after_cancel(self._resize_job)
+        self._resize_job = self.root.after(60, self._render_frame)
+
+    def _render_frame(self):
+        self._resize_job = None
+        fr = self.cur_frame
         if fr is None:
             return
-        self.cur_frame, self.cur_pos = fr, pos
         h, w = fr.shape[:2]
-        self.disp_scale = min(CANVAS_W / w, CANVAS_H / h)
-        img = Image.fromarray(fr[:, :, ::-1]).resize((int(w * self.disp_scale), int(h * self.disp_scale)), Image.BILINEAR)
+        self.disp_scale = min(self.cw / w, self.ch / h)
+        img = Image.fromarray(fr[:, :, ::-1]).resize((max(1, int(w * self.disp_scale)), max(1, int(h * self.disp_scale))), Image.BILINEAR)
         self.frame_img = ImageTk.PhotoImage(img)
         self.canvas.delete('frame')
+        self.canvas.configure(bg=ttk.Style(self.root).lookup('TFrame', 'background') or '#dcdad5')  # 畫面外不留黑邊
         self.canvas.create_image(0, 0, image=self.frame_img, anchor='nw', tags='frame')
         self.canvas.tag_lower('frame')
-        self.var_postxt.set('影片內 %s' % export.fmt_pos(pos))
         self.redraw_overlay()
+
+    def _pv_busy(self, tok):
+        if getattr(self, '_pv_shown', None) != tok:
+            self.var_postxt.set('讀取畫面中…')
+            self.var_osd.set('')
+            self.canvas.delete('busy')
+            cx, cy = self.cw / 2, self.ch / 2
+            self.canvas.create_rectangle(cx - 150, cy - 24, cx + 150, cy + 24,
+                                         fill='#202020', outline='#ffffff', tags='busy')
+            self.canvas.create_text(cx, cy, text='讀取畫面中，請稍候…', fill='#ffffff',
+                                    font=(self.font_family, 12, 'bold'), tags='busy')
+
+    def _show_preview(self, fr, pos):
+        self.canvas.delete('busy')
+        self.cur_frame, self.cur_pos = fr, pos
+        self._render_frame()
+        self.var_postxt.set('影片內 %s' % export.fmt_pos(pos))
         self.update_osd_label()
 
     def update_osd_label(self):
@@ -801,6 +1019,10 @@ class App:
         if self.scan_queue or any(f.get('info') is None for f in self.files):
             messagebox.showinfo(APP, '還在讀取影片的畫面時間，請等清單上的時間都出現後再開始。')
             return
+        hours = sum(((f.get('info') or {}).get('dur') or 600) for f in self.files) / 3600.0
+        if hours > MAX_HOURS:
+            messagebox.showerror(APP, '目前加入的影片合計約 %.1f 小時，超過一次 %d 小時的上限。\n請移除部分影片，分批判讀。' % (hours, MAX_HOURS))
+            return
         broken = [os.path.basename(f['path']) for f in self.files if f.get('info') == {}]
         if broken:
             messagebox.showerror(APP, '這些影片無法開啟，請先移除：\n' + '\n'.join(broken[:15]))
@@ -813,14 +1035,19 @@ class App:
         prof = self._collect_profile()
         files = [f['path'] for f in self.files]
         manual = [f.get('manual') for f in self.files]
-        base = os.path.dirname(files[0])
+        if self.out_location and not os.path.isdir(self.out_location):
+            messagebox.showerror(APP, '找不到結果存放位置：\n%s\n\n可能是資料夾被改名、刪除，或隨身碟／網路磁碟沒有接上。\n'
+                                 '請按「選擇存放位置…」重新選，或按「改回影片旁邊」。' % self.out_location)
+            return
+        root_dir = result_root(self.out_location, files[0])
         stamp = dt.datetime.now().strftime('%Y%m%d_%H%M%S')
         safe = ''.join('_' if c in '\\/:*?"<>|' else c for c in prof.name)
-        out = os.path.join(base, '判讀結果_%s_%s' % (safe, stamp))
+        out = os.path.join(root_dir, '%s_%s' % (safe, stamp))
+        self._made_root = None if os.path.isdir(root_dir) else root_dir   # 取消時只收掉這次才建立的空資料夾
         try:
             os.makedirs(out, exist_ok=True)
         except OSError as e:
-            messagebox.showerror(APP, '無法在影片資料夾建立結果資料夾：%s' % e)
+            messagebox.showerror(APP, '無法建立結果資料夾：\n%s\n\n%s\n\n請按「選擇存放位置…」換一個可以寫入的位置。' % (out, e))
             return
         self.cancel_flag = False
         self.run_t0 = time.time()
@@ -933,8 +1160,30 @@ class App:
                     if i is not None and self.tv_files.exists(str(i)):
                         vals, tag = self._row(f)
                         self.tv_files.item(str(i), values=vals, tags=tag)
-                    if not self.scan_queue:
-                        self.update_count()
+                    self.update_count()
+                elif kind == 'pv_prog':
+                    _, tok, p, target = m
+                    if tok == self._pv_token:
+                        self.var_postxt.set('讀取畫面中… %d%%' % min(99, 100 * p / max(1e-6, target)))
+                elif kind == 'pv_done':
+                    _, tok, fr, pos = m
+                    if tok == self._pv_token:
+                        self._pv_shown = tok
+                        if fr is not None:
+                            self._show_preview(fr, pos)
+                        else:
+                            self.canvas.delete('busy')
+                            self.var_postxt.set('讀不到這個位置的畫面')
+                elif kind == 'regen_done':
+                    _, e, err = m
+                    e.pop('media_busy', None)
+                    self.var_tab2msg.set(('截圖與短片產生失敗：%s' % err) if err else
+                                         '已依修改後的時間（%s～%s）重新產生截圖與短片。' % (core.fmt_time(e['start']), core.fmt_time(e['end'])))
+                    _i, cur = self._sel_event()
+                    if cur is e:
+                        self.show_shot(0)
+                    if e.pop('play_after', False) and e.get('clip'):
+                        open_path(os.path.join(self.result_dir, '短片', e['clip']))
                 elif kind == 'scan_done':
                     if self.scan_queue:
                         self._start_scanner()
@@ -945,13 +1194,15 @@ class App:
                     self.events, self.result_dir, self.run_files, self.run_timing, self.run_profile = evs, out, files, timing, prof
                     self.set_dirty(False)       # 判讀完已自動輸出 Excel
                     nv = sum(1 for e in evs if e['valid'])
-                    self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。結果在影片旁的「%s」資料夾。' % (
+                    self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
                         '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
                     self.fill_events()
-                    self.nb.select(self.tab2)
+                    self.nb.select(self.page2)
                 elif kind == 'stop':
                     self._run_finished()
                     self._remove_empty(m[2])
+                    if getattr(self, '_made_root', None):          # 這次才建立的空「判讀結果」資料夾也收掉
+                        self._remove_empty(self._made_root)
                     self.var_status.set('沒有開始判讀。')
                     messagebox.showwarning(APP, m[1])
                 elif kind == 'error':
@@ -964,6 +1215,51 @@ class App:
 
     def _run_finished(self):
         self.btn_run.configure(state='normal'); self.btn_cancel.configure(state='disabled')
+
+    # ------------------------------------------------------------ 結果存放位置
+    def update_out_location(self):
+        if not hasattr(self, 'var_outloc'):
+            return
+        if self.out_location:
+            txt = result_root(self.out_location, '')
+        elif self.files:
+            txt = result_root(None, self.files[0]['path'])
+        else:
+            txt = '影片旁邊的「%s」資料夾' % RESULT_FOLDER
+        txt = ('結果存放（預設）：' if self.out_location == self.out_default else '結果存放（只用這一次）：') + txt
+        self.var_outloc.set(txt)
+
+    def choose_out_location(self):
+        init = self.out_location or (os.path.dirname(self.files[0]['path']) if self.files else None)
+        d = filedialog.askdirectory(title='選擇判讀結果要存放的位置（會在裡面建立「%s」資料夾）' % RESULT_FOLDER,
+                                    initialdir=init, mustexist=True)
+        if not d:
+            return
+        d = os.path.abspath(d)
+        self.out_location = d
+        if d != self.out_default:
+            if self.confirm('結果存放位置', '判讀結果會存在：\n%s\n\n要把這個位置設成以後的預設嗎？\n'
+                            '（選「只用這一次」，下次開程式會回到原本的預設）' % result_root(d, ''),
+                            ok='設為預設', cancel='只用這一次'):
+                self._set_default_location(d)
+        self.update_out_location()
+
+    def reset_out_location(self):
+        self.out_location = None
+        if self.out_default is not None:
+            if self.confirm('結果存放位置', '這次的結果會放在影片旁邊的「%s」資料夾。\n\n'
+                            '要把以後的預設也改回影片旁邊嗎？\n（目前的預設是：%s）'
+                            % (RESULT_FOLDER, result_root(self.out_default, '')),
+                            ok='預設也改回', cancel='只用這一次'):
+                self._set_default_location(None)
+        self.update_out_location()
+
+    def _set_default_location(self, d):
+        self.settings['result_location'] = d
+        if save_settings(self.settings):
+            self.out_default = d
+        else:
+            messagebox.showwarning(APP, '無法儲存預設位置（程式資料夾和使用者資料夾都不能寫入），這次仍會使用您選的位置。')
 
     def _remove_empty(self, d):
         try:
@@ -1036,6 +1332,10 @@ class App:
         i, e = self._sel_event()
         if e is None:
             return
+        if e.get('media_busy'):
+            e['play_after'] = True
+            self.var_tab2msg.set('短片還在依修改後的時間產生中，做好會自動播放…')
+            return
         if not e.get('clip'):
             messagebox.showinfo(APP, '這一筆沒有短片（可在「進階」開啟產生短片）。')
             return
@@ -1052,7 +1352,7 @@ class App:
                 self.root.update_idletasks()
                 self.var_pos.set(max(0.0, (e.get('start_pos') or 0) - 2))
                 self.schedule_seek(10)
-                self.nb.select(self.tab1)
+                self.nb.select(self.page1)
                 return
         messagebox.showinfo(APP, '這一筆的影片不在第 1 頁的清單中：\n%s' % (e.get('start_file') or ''))
 
@@ -1080,6 +1380,14 @@ class App:
         if ne < ns:
             messagebox.showerror(APP, '車尾離開不能早於車頭到達。')
             return
+        time_changed = abs(ns - e['start']) > 0.05 or abs(ne - e['end']) > 0.05
+        if time_changed:
+            loc_s, loc_e = self._locate(ns), self._locate(ne)
+            if loc_s is None or loc_e is None:
+                messagebox.showerror(APP, '修改後的時間不在這次判讀的影片範圍內，請確認時間是否正確。')
+                return
+            e['start_file'], e['start_pos'] = loc_s
+            e['end_file'], e['end_pos'] = loc_e
         e['start'], e['end'] = ns, ne
         e['direction'] = self.var_dir.get()
         e['train_type'] = self.var_type.get().strip()
@@ -1087,6 +1395,42 @@ class App:
         e['checked'] = bool(self.var_checked.get())
         e['note'] = self.var_note.get().strip()
         self._refresh_keep(e)
+        if time_changed:
+            self.regen_media(e)
+
+    def _locate(self, ts):
+        """畫面時間 → (影片檔, 影片內秒數)；用這次判讀時每支影片的時間對照"""
+        best = None
+        for f, tm in zip(self.run_files, self.run_timing):
+            off = tm.get('offset')
+            if off is None:
+                continue
+            if not hasattr(self, '_dur_cache'):
+                self._dur_cache = {}
+            if f not in self._dur_cache:
+                self._dur_cache[f] = ((core.video_info(f) or {}).get('dur') or 0.0)
+            pos = ts - off
+            if -0.5 <= pos <= self._dur_cache[f] + 0.5:
+                best = (f, max(0.0, pos))
+                break
+        return best
+
+    def regen_media(self, e):
+        """時間改過的那一筆：依新的時間重做截圖（車頭／中間／車尾）與短片（前後各幾秒），在背景做"""
+        e['media_busy'] = True
+        prof = self.run_profile or self.profile
+        files = list(self.run_files)
+        out = self.result_dir
+        self.var_tab2msg.set('依修改後的時間重新產生截圖與短片中…')
+
+        def work():
+            try:
+                core.save_frames_and_clips([e], prof, out, files=files)
+                err = ''
+            except Exception as ex:
+                err = str(ex)
+            self.q.put(('regen_done', e, err))
+        threading.Thread(target=work, daemon=True).start()
 
     def toggle_valid(self):
         i, e = self._sel_event()
@@ -1097,9 +1441,17 @@ class App:
         note = e.get('note') or ''
         if tag not in note:
             e['note'] = (note + '；' + tag).strip('；')
-        if not e['valid']:
-            self.show_excluded.set(True)       # 讓剛改的那筆還看得到
         self._refresh_keep(e)
+        if not e['valid'] and not self.show_excluded.get():
+            # 不自動打開「顯示已排除」（使用者要求）；那一筆從清單消失，改選它原本位置的下一筆
+            kids = self.tv.get_children()
+            if kids:
+                nxt = next((k for k in kids if self.events[int(k)]['start'] >= e['start']), kids[-1])
+                self.tv.selection_set(nxt); self.tv.see(nxt)
+            else:
+                self.shot_canvas.delete('all'); self.var_shotlab.set('')
+            self.var_tab2msg.set('已把 %s～%s 那一筆改為「不是列車」。要再看到它，請勾「顯示已排除」。'
+                                 % (core.fmt_time(e['start']), core.fmt_time(e['end'])))
 
     def set_dirty(self, v):
         self.dirty = v
@@ -1107,6 +1459,7 @@ class App:
 
     def _refresh_keep(self, e):
         self.set_dirty(True)
+        self.var_tab2msg.set('')
         core.number_events(self.events)        # 依時間重新排序、編號
         i = next(k for k, x in enumerate(self.events) if x is e)
         self.fill_events()
@@ -1160,10 +1513,27 @@ class App:
         note = '（第 2 頁的修改還沒按「儲存修改並重新輸出 Excel」，但這份 TXT 已經是修改後的時間。）' if self.dirty else ''
         messagebox.showinfo(APP, '已輸出 %d 筆列車：\n%s\n\n已排除（非列車）的沒有輸出。%s' % (n, path, note))
 
+    def _results_start_dir(self):
+        """「開啟先前的結果…」從哪個資料夾開始：剛判讀（或剛開啟）的結果所在的「判讀結果」→
+        目前存放位置的「判讀結果」→ 預設位置的「判讀結果」；都不存在就交給作業系統"""
+        cands = []
+        if self.result_dir:
+            cands.append(os.path.dirname(os.path.abspath(self.result_dir)))
+        if self.files:
+            cands.append(result_root(self.out_location, self.files[0]['path']))
+        elif self.out_location:
+            cands.append(result_root(self.out_location, ''))
+        if self.out_default:
+            cands.append(result_root(self.out_default, ''))
+        for d in cands:
+            if d and os.path.isdir(d):
+                return d
+        return None
+
     def open_results(self):
         if self.dirty and not self.confirm('確認', '目前的結果有修改還沒儲存，開啟別的結果會放棄這些修改。\n\n確定要繼續嗎？', ok='確定', warn=True):
             return
-        p = filedialog.askopenfilename(title='選擇結果資料夾裡的 results.json', filetypes=[('判讀結果', 'results.json'), ('JSON', '*.json')])
+        p = filedialog.askopenfilename(title='選擇結果資料夾裡的 results.json', initialdir=self._results_start_dir(), filetypes=[('判讀結果', 'results.json'), ('JSON', '*.json')])
         if not p:
             return
         try:
@@ -1207,6 +1577,9 @@ class App:
         self.root.wait_window(w)
         return res['v']
 
+    def _stop_preview(self):
+        self._pv_token = getattr(self, '_pv_token', 0) + 1
+
     def on_close(self):
         """關閉前一律確認：確定＝關閉，取消＝不關閉"""
         if self.worker and self.worker.is_alive():
@@ -1235,7 +1608,8 @@ def main():
         except Exception:
             pass
     root = tk.Tk()
-    root.geometry('1320x820')
-    root.minsize(1200, 760)
+    sw, sh = root.winfo_screenwidth(), root.winfo_screenheight()
+    root.geometry('%dx%d' % (min(1320, sw - 40), min(820, sh - 80)))   # 螢幕比較小時一開始就不要超出螢幕
+    root.minsize(640, 420)                                           # 再小就用捲軸看（ScrollArea）
     App(root)
     root.mainloop()

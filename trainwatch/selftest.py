@@ -49,12 +49,13 @@ def make_video(path, seconds=40.0, trains=((5.0, +1), (22.0, -1)), speed=120.0, 
     return [(t0, t0 + length / speed, d) for t0, d in trains]   # 預期 (車頭到達, 車尾離開, 方向)
 
 
-def make_scene(path, seconds, trains=(), exposure=(), blobs=(), seed=2):
+def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2):
     """較完整的假影片（驗收測試用）。
     trains：dict(t0=車頭碰到參考線 x=350 的秒數, d=+1 往右／-1 往左, speed=像素／秒, length=車長像素,
                  y=(上, 下), stops=[(開始停的秒數, 停多久), …], car=每節車廂長, gap=車廂間空隙像素)
     exposure：[(開始秒, 結束秒, 亮度倍率)]（整個畫面一起變亮／變暗，模擬攝影機自動調亮度）
     blobs：[(開始秒, 結束秒, x, y, 半徑)]（亮光，模擬車燈照射）
+    local_light：[(開始秒, 結束秒, 亮度倍率)]（只有軌道一帶 y=140～240 變亮／變暗，模擬陽光、雲影；過渡 2 秒）
     回傳每列車預期的 (車頭到達, 車尾離開)"""
     import cv2
     rng = np.random.default_rng(seed)
@@ -99,6 +100,11 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), seed=2):
         for a_, b_, x, y, r in blobs:
             if a_ <= t <= b_:
                 cv2.circle(fr, (x, y), r, (255, 255, 255), -1)
+        for a_, b_, fac in local_light:
+            if a_ <= t <= b_ + 2:
+                k = min(1.0, (t - a_) / 2.0) if t <= b_ else max(0.0, 1 - (t - b_) / 2.0)
+                band = fr[140:240].astype(np.float32) * (1 + (fac - 1) * k)
+                fr[140:240] = np.clip(band, 0, 255).astype(np.uint8)
         f = 1.0
         for a_, b_, fac in exposure:
             if a_ <= t <= b_:

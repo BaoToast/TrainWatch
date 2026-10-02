@@ -9,3 +9,5 @@ dist/
 *.mp4
 *.avi
 expected.json
+判讀結果/
+程式設定.json
