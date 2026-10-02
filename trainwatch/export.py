@@ -154,7 +154,8 @@ def write_excel(path, events, profile: Profile, files, timing):
         off = tm.get('offset')
         ws3.append([os.path.basename(f), fmt_time(off, True) if off is not None else '',
                     tm.get('source', ''), ('%d%%' % round(tm['support'] * 100)) if tm.get('support') is not None else '',
-                    '；'.join(x for x in (tm.get('msg', ''), tm.get('stop', '').replace('\n', '')) if x)])
+                    '；'.join(x for x in (tm.get('msg', ''), tm.get('stop', '').replace('\n', ''),
+                                         tm.get('cam_note', '')) if x)])
     for c, w in zip('ABCDE', (40, 26, 12, 14, 50)):
         ws3.column_dimensions[c].width = w
     for r in (1, hdr):

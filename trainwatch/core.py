@@ -92,6 +92,146 @@ def fmt_time(ts: float, with_date=False) -> str:
 
 
 # ---------------------------------------------------------------- 判讀
+class CameraGuard:
+    """攝影機位置基準（#75～#77）。和列車背景（Detector.bg）分開：
+    - 基準＝批次開頭前 2 秒內 5 格「軌道以外」畫面的邊緣強度圖中位數（不用 90 秒中位數：攝影機在那段期間移動時，
+      移動後的畫面會佔多數，反而把舊位置當成異常）。
+    - 比較方法：cv2.phaseCorrelate（相位相關）算目前畫面相對基準「平移了幾像素」與可信度 r。
+      用邊緣強度、再除以高位數正規化 → 整體亮度、曝光變化不影響。
+      真實樣本實測：同一光線下 5 秒～10 分鐘，平移 < 0.3 像素、r ≥ 0.74；人為平移 4×3、10×0 像素量得到誤差 < 0.5；
+      移動 14×9＋轉 1.5 度：量到 13～14 像素平移。
+    - 判定「位置改變」：平移 ≥ MOVE_PX（6 像素）且 r ≥ 0.15 開始懷疑；之後量到的平移一直穩定（方向、大小差 < 3 像素），
+      持續 HOLD 秒（有列車通過時 HOLD_EVENT 秒）就確認。
+      **不用「r 變低」當移動的證據**：白天有風時樹葉晃動，r 在 10 秒內就會從 0.9 掉到 0.5 以下（實測），會大量誤判。
+    - 基準何時更新：每 UPDATE 秒，如果目前畫面和基準「沒有平移（< 1 像素）而且 r ≥ 0.3」，就換成目前畫面
+      （基準一直保持是幾秒前的畫面，跟上樹葉、光線、陰影）。攝影機被碰是突然的平移，不會被慢慢學進去。
+      **疑似移動期間（suspect）完全不更新**；錄影中斷、重建列車背景也不更新（錄影中斷另外用 gap_check 比對）。
+    - 超過 STALE 秒都沒辦法更新（r 一直很低，例如彩色↔紅外線切換、光線劇烈變化），但也沒有平移：重新建立基準，
+      並記在 notes（品質摘要、Excel 會寫出來，不是默默發生）。
+    - 已知限制：只有轉動、幾乎沒有平移的碰撞偵測不到（轉 1.5 度時，畫面中央附近的參考線只移動約 1 像素）。"""
+    K = 2               # 畫面縮成 1/2 再比（320×180）
+    MOVE_PX = 6.0       # 平移幾像素（原始 640×360）以上算移動。6 像素在參考線上約差 0.02～0.06 秒，使用者可接受誤差是 5 秒
+    HOLD = 5.0
+    HOLD_EVENT = 5.0     # 列車在軌道範圍裡，比對時已經遮掉，所以和平常一樣
+    UPDATE = 2.0
+    STALE = 60.0
+    STEP = 0.5          # 每幾秒比一次
+
+    def __init__(self, profile: Profile, size=(640, 360)):
+        self.p = profile
+        self.size = None
+        self.ref = None
+        self.ref_t = None
+        self.build = []          # 建立基準用的前幾格
+        self.build_t0 = None
+        self.last = -1e9
+        self.suspect = None      # (開始時間, 影片, 秒數)
+        self.suspect_v = (0.0, 0.0)
+        self.mode = None         # 'day'／'night'
+        self.mode_t = -1e9
+        self.notes = []
+        self.last_result = None
+
+    def _mask(self, w, h):
+        k = self.K
+        m = np.ones((h // k, w // k), bool)
+        x0, y0, x1, y1 = self.p.track_rect
+        m[max(0, (min(y0, y1) - 20) // k):(max(y0, y1) + 20) // k + 1, max(0, (min(x0, x1) - 20) // k):(max(x0, x1) + 20) // k + 1] = False
+        m[:40 // k] = False      # 上方時間字幕
+        return m
+
+    def prep(self, frame_bgr):
+        h, w = frame_bgr.shape[:2]
+        if self.size != (w, h):
+            self.size = (w, h)
+            self.mask = self._mask(w, h)
+            self.win = cv2.createHanningWindow((w // self.K, h // self.K), cv2.CV_32F)
+        g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32)
+        g = cv2.resize(g, (w // self.K, h // self.K), interpolation=cv2.INTER_AREA)
+        e = np.hypot(cv2.Sobel(g, cv2.CV_32F, 1, 0), cv2.Sobel(g, cv2.CV_32F, 0, 1))
+        hi = float(np.percentile(e[self.mask], 99)) if self.mask.any() else 1.0
+        e = np.minimum(e / (hi + 1e-6), 1.0)
+        e[~self.mask] = 0
+        return e
+
+    def compare(self, a, b, vec=False):
+        """回傳 (平移像素（原始大小）, r)；vec=True 另外回傳 (dx, dy)"""
+        (dx, dy), r = cv2.phaseCorrelate(a, b, self.win)
+        out = (float(np.hypot(dx, dy)) * self.K, float(r))
+        return out + ((dx * self.K, dy * self.K),) if vec else out
+
+    def check(self, t, frame_bgr, sat, active, file, pos):
+        """每一格呼叫。確認位置改變時回傳 (改變開始的時間, 影片, 秒數)，否則 None"""
+        if frame_bgr is None or t - self.last < self.STEP:
+            return None
+        self.last = t
+        mode = 'day' if sat >= self.p.day_saturation else ('night' if sat < 12 else self.mode)
+        if mode != self.mode:
+            if self.mode is not None:
+                self.mode_t = t
+            self.mode = mode
+        cur = self.prep(frame_bgr)
+        if self.ref is None:
+            if self.build_t0 is None:
+                self.build_t0 = t
+            self.build.append(cur)
+            if len(self.build) >= 5 or t - self.build_t0 >= 2.0:
+                self.ref, self.ref_t, self.build = np.median(np.stack(self.build), axis=0).astype(np.float32), t, []
+            return None
+        shift, r, v = self.compare(self.ref, cur, vec=True)
+        self.last_result = (shift, r)
+        # 疑似移動：第一次要 r ≥ 0.15；之後只要量到的平移方向、大小一直差不多（< 3 像素），就算 r 變低也持續
+        # （基準停在移動前，樹葉晃動會讓 r 越來越低，但真正的平移量會一直穩定；雜訊造成的假平移每次都不一樣）
+        start = shift >= self.MOVE_PX and r >= 0.15
+        keep = (self.suspect is not None and shift >= self.MOVE_PX
+                and np.hypot(v[0] - self.suspect_v[0], v[1] - self.suspect_v[1]) < 3.0)
+        if keep or start:
+            if self.suspect is None:
+                self.suspect, self.suspect_v = (t, file, pos), v
+            if t - self.suspect[0] >= (self.HOLD_EVENT if active else self.HOLD):
+                return self.suspect
+            return None                       # 疑似移動期間不更新基準
+        self.suspect = None
+        if shift < 1.0 and r >= 0.3:
+            if t - self.ref_t >= self.UPDATE:
+                self.ref, self.ref_t = cur, t
+        elif t - self.ref_t >= self.STALE and shift < 3.0:
+            self.ref, self.ref_t = cur, t
+            why = ('切換為%s' % ('紅外線（黑白）' if self.mode == 'night' else '彩色')) if t - self.mode_t < self.STALE + 5 \
+                else '畫面變化很大'
+            self.notes.append(dict(file=file, t=t, text='%s：%s（%s）' % (fmt_time(t), why, os.path.basename(file or ''))))
+        return None
+
+    def gap_check(self, path):
+        """錄影中斷後：拿中斷前最後的基準，和下一支影片前 2 秒的畫面比對。回傳 'same'／'moved'／'uncertain'。
+        same＝確認位置一致（基準換成新影片的畫面，繼續判讀）；moved／uncertain＝停止判讀（不知道就不默默繼續）"""
+        if self.ref is None:
+            return 'same'
+        frames = []
+        cap = cv2.VideoCapture(path)
+        try:
+            while len(frames) < 5:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if p >= len(frames) * 0.4:
+                    frames.append(self.prep(fr))
+        finally:
+            cap.release()
+        if len(frames) < 3:
+            return 'uncertain'
+        new = np.median(np.stack(frames), axis=0).astype(np.float32)
+        shift, r = self.compare(self.ref, new)
+        self.last_result = (shift, r)
+        if shift >= self.MOVE_PX and r >= 0.15:
+            return 'moved'
+        if shift < 3.0 and r >= GAP_SAME_R:
+            self.ref, self.suspect, self.last = new, None, -1e9
+            return 'same'
+        return 'uncertain'
+
+
 class Detector:
     """逐格餵影像（灰階、已裁切到工作範圍），產生事件。可跨檔案連續使用（背景延續）。"""
     SIDE_WINDOW = 2.0      # 事件前後看幾秒
@@ -128,11 +268,13 @@ class Detector:
         self.start_kind = 'video'   # 一開始就有變化時的原因：video＝第一支影片開頭、gap＝錄影中斷後
         self.bg_note = ''       # 初始背景的說明（背景不確定時，這支影片的列車都標需確認）
         self.bg_note_file = None
+        self.guard = CameraGuard(profile)   # 攝影機位置基準（和列車背景分開，錄影中斷後也不重建，#75、#76）
         self.camera_stop = None  # 偵測到攝影機位置改變：dict(t=畫面時間, file=影片, pos=影片內秒數)，判讀就此停止（#71）
         self.small = self.bg_small = self.out_mask = None   # 整個畫面縮小版（估計攝影機自動調亮度）
 
     def feed(self, t_abs: float, gray: np.ndarray, sat: float, file: str, pos: float, frame_bgr=None):
         g = gray.astype(np.float32)
+        self._frame, self._sat = frame_bgr, sat
         if self.first_t is None:
             self.first_t = t_abs
         if self.bg is None or self.bg.shape != g.shape:
@@ -249,26 +391,15 @@ class Detector:
                 self.bg_small = self.bg_small * (1 - a) + self.small * a
 
     EXPO_SCALE = 8
-    CAM_NCC = 0.35        # 軌道以外的畫面和背景的紋理相關低於這個值＝攝影機畫面整個改變（樣本最低：白天 0.83、夜間車燈 0.56）
-    CAM_SEC = 5.0         # 持續幾秒才算（車燈、閃光只有一下子）
-
     def _camera_check(self, t_abs, g, gain, file, pos):
-        """攝影機被碰歪、轉動：整個畫面（含軌道以外的樹、山、天空）都和背景不一樣，紋理相關很低。
-        列車只會改變軌道那一帶，車燈照亮只是亮度變、而且很短。持續 CAM_SEC 秒就：
-        進行中的那一筆在畫面改變的那一刻結束（車尾未確認；如果是畫面改變才「開始」的，就不是列車），
+        """攝影機位置改變（被碰歪、轉動）：交給 CameraGuard 判斷（和列車背景分開，#75～#77）。
+        確認後：進行中的那一筆在改變的那一刻結束（車尾未確認；改變那一刻才開始的，就不是列車），
         然後**停止這次判讀**（self.camera_stop）：參考線、軌道範圍是固定的像素位置，攝影機動了就不再對準原本的
-        真實位置，不可以重建背景後繼續用（#71，v1.0.10 的「重建背景繼續判讀」已撤回）。
-        回傳 True＝已偵測到，process() 會停止"""
-        ncc = getattr(self, '_out_ncc', None)
-        if ncc is None or ncc >= self.CAM_NCC:
-            self.cam_since = None
+        真實位置，不可以重建背景後繼續用（#71）。回傳 True＝已偵測到，process() 會停止"""
+        hit = self.guard.check(t_abs, self._frame, self._sat, self.cur is not None, file, pos)
+        if not hit:
             return False
-        if getattr(self, 'cam_since', None) is None:
-            self.cam_since = (t_abs, file, pos)
-            return False
-        t0, f0, p0 = self.cam_since
-        if t_abs - t0 < self.CAM_SEC:
-            return False
+        t0, f0, p0 = hit
         if self.cur is not None:
             c = self.cur
             if c['end'] > t0:
@@ -277,13 +408,12 @@ class Detector:
             c['camera_t'] = t0
             self.pending_close = None
             self.finish('camera')
-        self.camera_stop = dict(t=t0, file=f0, pos=p0)
+        self.camera_stop = dict(t=t0, file=f0, pos=p0, kind='moved', result='moved')
         return True
 
     def _exposure(self, frame_bgr):
         """整個畫面（扣掉軌道範圍附近與上方字幕）目前亮度 ÷ 背景亮度的中位數"""
         self.small = None
-        self._out_ncc = None
         if frame_bgr is None:
             return 1.0
         k = self.EXPO_SCALE
@@ -305,9 +435,7 @@ class Detector:
             self.out_mask = m
         sel = self.out_mask & (self.bg_small > 15) & (self.bg_small < 245)
         if sel.sum() < 50:
-            self._out_ncc = None
             return 1.0
-        self._out_ncc = _ncc(sm[sel], self.bg_small[sel])
         r = float(np.median(sm[sel] / self.bg_small[sel]))
         return r if 0.5 < r < 2.0 and abs(r - 1) > 0.01 else 1.0
 
@@ -561,6 +689,7 @@ def process(files: List[str], bases: List[float], profile: Profile,
         crop = work_crop(profile, W, H)
         if det is None:
             det = Detector(profile, crop)
+            batch_t0 = base
             det.bg, det.bg_note = initial_background(f, crop, profile)   # 開頭若剛好有列車經過，不會被當成背景
             det.bg_note_file = f
         elif prev_end is not None and base < prev_end - OVERLAP_SEC:
@@ -573,6 +702,17 @@ def process(files: List[str], bases: List[float], profile: Profile,
             # 錄影中斷（缺檔）：前後不是連續畫面。進行中的那一筆在中斷處結束（車尾未確認），背景重新建立（#49）
             gap = base - prev_end
             det.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
+            # 攝影機位置：中斷前後要確認一致才可以繼續用原本的參考線（#76）
+            res = det.guard.gap_check(f)
+            if res != 'same':
+                cap.release()
+                if info is not None:
+                    shift, r = det.guard.last_result or (0.0, 0.0)
+                    info['camera'] = dict(t=base, file=f, pos=0.0, kind='gap', result=res, prev_end=prev_end,
+                                          shift=round(shift, 1), r=round(r, 2))
+                if info is not None and det.guard.notes:
+                    info['notes'] = list(det.guard.notes)
+                return det.events
             bg, note = initial_background(f, crop, profile)
             det.restart(bg, note)
             det.bg_note_file = f
@@ -596,9 +736,13 @@ def process(files: List[str], bases: List[float], profile: Profile,
             k += 1
             if det.camera_stop:                    # 攝影機位置改變：停止判讀（#71）
                 cap.release()
+                evs = det.finish('camera')
+                _mark_initial_window(evs, det, batch_t0)
                 if info is not None:
                     info['camera'] = dict(det.camera_stop)
-                return det.finish('camera')
+                    if det.guard.notes:
+                        info['notes'] = list(det.guard.notes)
+                return evs
             if progress and k % 150 == 0:
                 progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
             if cancel and k % 30 == 0 and cancel():
@@ -607,9 +751,33 @@ def process(files: List[str], bases: List[float], profile: Profile,
         prev_end = base + last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15) if k else base
         cap.release()
         done += durs[fi]
+    if det and info is not None and det.guard.notes:
+        info['notes'] = list(det.guard.notes)
     return det.finish('video_end') if det else []
 
 
+def _mark_initial_window(evs, det, batch_t0, window=90.0):
+    """攝影機在批次開頭 window 秒內移動：初始列車背景（開頭 90 秒中位數）混到了移動後的畫面，
+    這段時間的判讀不可靠（#75）。從批次一開始就有、一直到攝影機改變才結束的那一筆＝背景錯位造成的，不是列車；
+    其他在改變前開始的標需確認"""
+    t0 = det.camera_stop['t']
+    if t0 - batch_t0 > window:
+        return
+    for e in evs:
+        if e['start'] >= t0 or not e.get('valid'):
+            continue
+        if e['start'] - batch_t0 < 2.0 and e['end'] >= t0 - 0.5:
+            e['valid'] = False
+            e['reason'] = ('攝影機在影片開頭 %d 秒內移動，初始背景混到移動後的畫面，這一筆是背景錯位造成的，不是列車；' % window
+                           + e.get('reason', '')).rstrip('；')
+        else:
+            e['need_check'] = True
+            e['reason'] = (e.get('reason', '') + '；攝影機在影片開頭 %d 秒內移動，初始背景可能混到移動後的畫面，這一筆的時間可能不準'
+                           % window).strip('；')
+            e.setdefault('check_items', []).append('攝影機在開頭移動（時間可能不準）')
+
+
+GAP_SAME_R = 0.3   # 錄影中斷前後比對：r 至少這麼高（而且平移 < 3 像素）才算確認位置一致
 GAP_SEC = 5.0       # 前一支影片結束到下一支開始超過幾秒，就當成錄影中斷（和開始判讀前的「缺檔」檢查一致）
 OVERLAP_SEC = 2.0   # 下一支影片比上一支實際結尾早超過幾秒，就是時間重疊／倒退（和開始判讀前的「重疊」檢查一致）
 

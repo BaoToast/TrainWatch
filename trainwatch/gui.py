@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.11'
+VERSION = '1.0.12'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -249,11 +249,30 @@ def final_order(files, timing):
 
 
 def camera_stop_text(cam):
-    """攝影機位置改變而停止判讀的說明（品質摘要、Excel「設定與影片」、results.json 都用這一段）"""
+    """攝影機位置改變而停止判讀的說明（品質摘要、Excel「設定與影片」、results.json 都用這一段）。
+    kind='gap'（錄影中斷前後比對）分 moved／uncertain 兩種說法（#77、#80）"""
+    name = os.path.basename(cam['file'])
+    tail = ('判讀在這裡停止，之後的影片沒有判讀。\n'
+            '原本參考線與軌道範圍可能已失效，請重新確認監測站設定後，\n從這個時間之後的影片開始判讀。')
+    if cam.get('kind') == 'gap':
+        head = ('錄影中斷後的場景位置和中斷前明顯不同\n（攝影機可能被移動）。\n' if cam.get('result') == 'moved' else
+                '錄影中斷前後的畫面無法確認位置是否相同\n（例如一邊白天、一邊紅外線，或光線差很多）。\n')
+        prev = ('中斷前最後畫面時間：約%s\n' % core.fmt_time(cam['prev_end'], True)) if cam.get('prev_end') is not None else ''
+        return (head + '影片：%s（中斷後的第一支）\n畫面時間：約%s\n' % (name, core.fmt_time(cam['t'], True))
+                + prev + tail)
     return ('偵測到攝影機位置／角度改變。\n影片：%s（影片內約%s）\n畫面時間：約%s\n'
-            '判讀在這裡停止，之後的影片沒有判讀。\n'
-            '原本參考線與軌道範圍可能已失效，請重新確認監測站設定後，\n從這個時間之後的影片開始判讀。'
-            % (os.path.basename(cam['file']), export.fmt_pos(cam['pos']), core.fmt_time(cam['t'], True)))
+            % (name, export.fmt_pos(cam['pos']), core.fmt_time(cam['t'], True))) + tail
+
+
+def apply_camera_info(info, files, timing):
+    """把 core.process 回傳的攝影機資訊寫進各影片的 timing：stop（停止判讀）、cam_note（位置基準重新建立，#80）"""
+    cam = info.get('camera')
+    for f, t in zip(files, timing):
+        if cam and f == cam['file']:
+            t['stop'] = camera_stop_text(cam)
+        txt = [n['text'] for n in info.get('notes', ()) if n.get('file') == f]
+        if txt:
+            t['cam_note'] = '；'.join(txt)
 
 
 def mark_time_jumps(evs, files, timing):
@@ -293,6 +312,11 @@ def quality_summary(evs, cancelled=False, timing=()):
     if notes:
         lines.append('')
         lines.extend(notes)
+    cam_notes = [t['cam_note'] for t in timing if t.get('cam_note')]
+    if cam_notes:                                     # 位置基準重新建立（#80）：不是默默發生
+        lines.append('')
+        lines.append('攝影機位置基準重新建立（前後畫面無法可靠比對，\n但沒有偵測到移動，供參考）：')
+        lines.extend('　・' + x for x in cam_notes)
     if need:
         lines.append('')
         lines.append('需人工確認的在第2頁以淡黃色標示，原因寫在「備註」欄。\n一筆可能同時有好幾個原因。')
@@ -567,6 +591,7 @@ class App:
         t = self.tab2
         top = ttk.Frame(t); top.pack(fill='x', padx=4, pady=(4, 4))
         ttk.Button(top, text='開啟先前的結果…', command=self.open_results).pack(side='left')
+        ttk.Button(top, text='手動新增列車…', command=self.manual_add).pack(side='left', padx=(6, 0))
         ttk.Button(top, text='開啟結果資料夾', command=lambda: self.result_dir and open_path(self.result_dir)).pack(side='right')
         ttk.Button(top, text='輸出噪音分析用 TXT', command=self.export_noise).pack(side='right', padx=(6, 6))
         ttk.Button(top, text='儲存修改並重新輸出 Excel', style='Big.TButton', command=self.save_results).pack(side='right', padx=6)
@@ -1408,11 +1433,7 @@ class App:
                 self.q.put(('stop', str(ex), out))
                 return
             mark_time_jumps(evs, files, timing)
-            cam = info.get('camera')
-            if cam:                                                    # 攝影機位置改變 → 判讀已停止（#71）
-                for f, t in zip(files, timing):
-                    if f == cam['file']:
-                        t['stop'] = camera_stop_text(cam)
+            apply_camera_info(info, files, timing)                      # 攝影機位置改變 → 判讀已停止（#71、#80）
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
             core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files, bases=bases)
@@ -1742,8 +1763,9 @@ class App:
             old = (e.get('shots') or [''])[0].split('_')[0] or (e.get('clip') or '').split('.')[0]
             if old:
                 work_ev['media_tag'] = old
-        self.var_tab2msg.set('依修改後的時間重新產生截圖與短片中…（完成前不能再套用修改或儲存）' if why == 'time'
-                             else '產生這一筆的短片中…（完成前不能再套用修改或儲存）')
+        self.var_tab2msg.set({'time': '依修改後的時間重新產生截圖與短片中…（完成前不能再套用修改或儲存）',
+                              'add': '產生新增這一筆的截圖與短片中…（完成前不能再套用修改或儲存）'}.get(
+                                 why, '產生這一筆的短片中…（完成前不能再套用修改或儲存）'))
 
         def work():
             try:
@@ -1788,6 +1810,91 @@ class App:
     def set_dirty(self, v):
         self.dirty = v
         self.root.title('%s v%s%s' % (APP, VERSION, '　（有修改還沒儲存）' if v else ''))
+
+    def manual_add(self):
+        """程式漏判時，使用者自己新增一筆列車（#78）。依時間找到影片，產生截圖與短片，備註標「人工新增」"""
+        if not self.result_dir or not self.run_files:
+            messagebox.showinfo(APP, '請先判讀，或按「開啟先前的結果…」開啟一份結果，再新增。')
+            return
+        if self._media_busy():
+            return
+        _i, sel = self._sel_event()
+        ref = sel['start'] if sel else next((t.get('offset') for t in self.run_timing if t.get('offset') is not None), None)
+        if ref is None:
+            messagebox.showerror(APP, '這份結果沒有影片的時間資料，無法新增。')
+            return
+        w = tk.Toplevel(self.root)
+        w.title('手動新增列車')
+        w.transient(self.root)
+        w.resizable(False, False)
+        g = ttk.Frame(w, padding=(16, 14, 16, 4)); g.pack(fill='both')
+        v_date = tk.StringVar(value=dt.datetime.fromtimestamp(ref).strftime('%Y-%m-%d'))
+        v_s, v_e, v_dir, v_type, v_note = tk.StringVar(), tk.StringVar(), tk.StringVar(value='往右'), tk.StringVar(), tk.StringVar()
+        rows = [('日期（車頭到達那天）', ttk.Entry(g, textvariable=v_date, width=14)),
+                ('車頭到達（時:分:秒）', ttk.Entry(g, textvariable=v_s, width=14)),
+                ('車尾離開（時:分:秒）', ttk.Entry(g, textvariable=v_e, width=14)),
+                ('方向', ttk.Combobox(g, textvariable=v_dir, values=export.DIRS, width=12, state='readonly')),
+                ('車種（可不填）', ttk.Combobox(g, textvariable=v_type, values=export.TYPES, width=16)),
+                ('備註（可不填）', ttk.Entry(g, textvariable=v_note, width=30))]
+        for k, (lab, wid) in enumerate(rows):
+            ttk.Label(g, text=lab).grid(row=k, column=0, sticky='w', pady=3, padx=(0, 8))
+            wid.grid(row=k, column=1, sticky='w', pady=3)
+        ttk.Label(g, style='Hint.TLabel', justify='left', text=(
+            '時間例：08:15:30.5。車尾離開比車頭到達早，表示跨過午夜。\n'
+            '新增後會自動產生截圖與短片，備註會標「人工新增」。\n'
+            '新增錯了，可以選那一筆按「改為『不是列車』」。')).grid(
+            row=len(rows), column=0, columnspan=2, sticky='w', pady=(6, 0))
+        res = {}
+
+        def ok():
+            try:
+                day = dt.datetime.strptime(v_date.get().strip(), '%Y-%m-%d').timestamp()
+                ns = day + parse_hms(v_s.get())
+                ne = day + parse_hms(v_e.get())
+            except ValueError as ex:
+                messagebox.showerror(APP, '日期或時間格式不對：%s' % ex, parent=w)
+                return
+            if ne <= ns:
+                ne += 86400                          # 跨午夜
+            if ne - ns > 6 * 3600:
+                messagebox.showerror(APP, '車尾離開和車頭到達相差超過 6 小時，請確認時間。', parent=w)
+                return
+            ls, le = self._locate(ns), self._locate(ne)
+            if ls is None or le is None:
+                messagebox.showerror(APP, '%s 沒有對應的錄影畫面（不在這次判讀的影片範圍內，或落在兩支影片中間沒有錄影的缺口）。'
+                                     % core.fmt_time(ns if ls is None else ne), parent=w)
+                return
+            ov = [x for x in self.events if x.get('valid') and x['start'] < ne and x['end'] > ns]
+            if ov and not self.confirm('和現有的列車重疊', '新增的時間和第 %s 筆（%s～%s）重疊。\n\n'
+                                       '交會、重疊的列車應該合併成一筆（請直接修改那一筆的時間）。\n確定要另外新增嗎？'
+                                       % ('、'.join(str(x['no']) for x in ov), core.fmt_time(ov[0]['start']), core.fmt_time(ov[0]['end'])),
+                                       ok='仍要新增', warn=True):
+                return
+            res.update(ns=ns, ne=ne, ls=ls, le=le)
+            w.destroy()
+        bar = ttk.Frame(w, padding=(16, 8, 16, 14)); bar.pack(fill='x')
+        ttk.Button(bar, text='取消', width=10, command=w.destroy).pack(side='right')
+        ttk.Button(bar, text='新增', width=10, command=ok).pack(side='right', padx=(0, 8))
+        w.update_idletasks()
+        w.geometry('+%d+%d' % (max(0, self.root.winfo_rootx() + (self.root.winfo_width() - w.winfo_width()) // 2),
+                               max(0, self.root.winfo_rooty() + (self.root.winfo_height() - w.winfo_height()) // 3)))
+        w.grab_set()
+        rows[1][1].focus_set()
+        self.root.wait_window(w)
+        if not res:
+            return
+        n = 1 + max([int(x['media_tag'][1:]) for x in self.events if str(x.get('media_tag', '')).startswith('M')
+                     and x['media_tag'][1:].isdigit()] + [0])
+        note = v_note.get().strip()
+        e = dict(start=res['ns'], end=res['ne'], first_change=res['ns'], last_change=res['ne'],
+                 start_file=res['ls'][0], start_pos=res['ls'][1], end_file=res['le'][0], end_pos=res['le'][1],
+                 coverage=0.0, both=0.0, peak=0.0, direction=v_dir.get(), dir_on=0.0, dir_off=0.0, dir_confident=True,
+                 night=False, valid=True, need_check=False, checked=True, end_known=True, start_known=True,
+                 reason='人工新增（不是程式判讀的）', check_items=[], train_type=v_type.get().strip(), crossing=False,
+                 note=('人工新增；' + note) if note else '人工新增', shots=[], clip='', media_tag='M%03d' % n)
+        self.events.append(e)
+        self._refresh_keep(e)
+        self.regen_media(e, why='add')
 
     def _refresh_keep(self, e):
         self.set_dirty(True)
@@ -1916,8 +2023,27 @@ class App:
         y = self.root.winfo_rooty() + (self.root.winfo_height() - w.winfo_height()) // 3
         w.geometry('+%d+%d' % (max(0, x), max(0, y)))
         (b_cancel if warn else b_ok).focus_set()      # 有未儲存的修改時，預設按鈕是「取消」
+        # 主視窗縮小時跳出的視窗會被 Windows 一起藏起來，主視窗又被它擋住、看起來像當掉（#74）：
+        # 先把主視窗叫回來、視窗放到最上層；之後點主視窗也會把這個視窗帶到前面
+        try:
+            if self.root.state() in ('iconic', 'withdrawn'):
+                self.root.deiconify()
+            w.lift()
+            w.attributes('-topmost', True)
+            w.after(400, lambda: w.winfo_exists() and w.attributes('-topmost', False))
+            w.focus_force()
+        except tk.TclError:
+            pass
+        bring = lambda e=None: (w.winfo_exists() and (w.lift(), w.focus_force()))
+        bid = self.root.bind('<FocusIn>', bring, add='+')
+        bid2 = self.root.bind('<Map>', bring, add='+')
         w.grab_set()
         self.root.wait_window(w)
+        for seq, b_ in (('<FocusIn>', bid), ('<Map>', bid2)):
+            try:
+                self.root.unbind(seq, b_)
+            except tk.TclError:
+                pass
         return res['v']
 
     def _stop_preview(self):
