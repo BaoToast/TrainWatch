@@ -142,6 +142,9 @@ def write_excel(path, events, profile: Profile, files, timing):
             ['需人工確認筆數', sum(1 for e in valid if e.get('need_check') and not e.get('checked'))],
             ['已排除筆數', len(excl)],
             ['產生時間', dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]]
+    stops = [tm.get('stop') for tm in timing if tm.get('stop')]
+    if stops:                                   # 攝影機位置改變而停止判讀（#71）
+        rows.insert(1, ['⚠ 判讀中途停止', stops[0].replace('\n', '')])
     for r in rows:
         ws3.append(r)
     ws3.append([])
@@ -151,7 +154,7 @@ def write_excel(path, events, profile: Profile, files, timing):
         off = tm.get('offset')
         ws3.append([os.path.basename(f), fmt_time(off, True) if off is not None else '',
                     tm.get('source', ''), ('%d%%' % round(tm['support'] * 100)) if tm.get('support') is not None else '',
-                    tm.get('msg', '')])
+                    '；'.join(x for x in (tm.get('msg', ''), tm.get('stop', '').replace('\n', '')) if x)])
     for c, w in zip('ABCDE', (40, 26, 12, 14, 50)):
         ws3.column_dimensions[c].width = w
     for r in (1, hdr):

@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.10'
+VERSION = '1.0.11'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -248,6 +248,14 @@ def final_order(files, timing):
     return files, timing, note, overlap
 
 
+def camera_stop_text(cam):
+    """攝影機位置改變而停止判讀的說明（品質摘要、Excel「設定與影片」、results.json 都用這一段）"""
+    return ('偵測到攝影機位置／角度改變。\n影片：%s（影片內約%s）\n畫面時間：約%s\n'
+            '判讀在這裡停止，之後的影片沒有判讀。\n'
+            '原本參考線與軌道範圍可能已失效，請重新確認監測站設定後，\n從這個時間之後的影片開始判讀。'
+            % (os.path.basename(cam['file']), export.fmt_pos(cam['pos']), core.fmt_time(cam['t'], True)))
+
+
 def mark_time_jumps(evs, files, timing):
     """正式校正發現畫面時間中途跳動的影片：這支影片裡的列車標需人工確認（#52）"""
     jumpy = {f: t.get('msg') for f, t in zip(files, timing) if t.get('msg')}
@@ -266,7 +274,9 @@ def quality_summary(evs, cancelled=False, timing=()):
     """判讀完成的品質摘要文字（#61）"""
     valid = [e for e in evs if e.get('valid')]
     need = [e for e in valid if e.get('need_check')]
-    lines = ['%s判讀完成。' % ('已取消，部分' if cancelled else ''),
+    stop = next((t.get('stop') for t in timing if t.get('stop')), None)
+    lines = (['判讀中途停止。' + stop, '', '停止前已完成的部分：'] if stop else
+             ['%s判讀完成。' % ('已取消，部分' if cancelled else '')]) + [
              '列車 %d 筆、已排除 %d 筆。' % (len(valid), len(evs) - len(valid)),
              '需人工確認 %d 筆%s' % (len(need), '，其中：' if need else '。')]
     cnt = {}
@@ -1391,12 +1401,18 @@ class App:
                 return
             bases = [t['offset'] for t in timing]
             prog = lambda fr, msg: self.q.put(('prog', 0.08 + fr * 0.8, '判讀中：' + msg))
+            info = {}
             try:
-                evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag)
+                evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag, info=info)
             except core.TimeOrderError as ex:                       # 判讀途中發現時間倒退／重疊（#69）
                 self.q.put(('stop', str(ex), out))
                 return
             mark_time_jumps(evs, files, timing)
+            cam = info.get('camera')
+            if cam:                                                    # 攝影機位置改變 → 判讀已停止（#71）
+                for f, t in zip(files, timing):
+                    if f == cam['file']:
+                        t['stop'] = camera_stop_text(cam)
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
             core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files, bases=bases)
@@ -1472,8 +1488,13 @@ class App:
                     self.set_dirty(False)       # 判讀完已自動輸出 Excel
                     nv = sum(1 for e in evs if e['valid'])
                     self.root.after(300, lambda evs=evs, c=cancelled, t=timing: self.show_summary(evs, c, t))
-                    self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
-                        '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
+                    stopped = any(t.get('stop') for t in timing)
+                    if stopped:
+                        self.var_status.set('⚠ 攝影機位置改變，判讀已停止。\n停止前：列車%d筆、已排除%d筆。\n結果資料夾：%s'
+                                            % (nv, len(evs) - nv, os.path.basename(out)))
+                    else:
+                        self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
+                            '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
                     self.fill_events()
                     self.nb.select(self.page2)
                 elif kind == 'stop':
@@ -1540,7 +1561,7 @@ class App:
             messagebox.showwarning(APP, '無法儲存預設位置（程式資料夾和使用者資料夾都不能寫入），這次仍會使用您選的位置。')
 
     def show_summary(self, evs, cancelled, timing):
-        need = any(e.get('need_check') for e in evs if e.get('valid'))
+        need = any(e.get('need_check') for e in evs if e.get('valid')) or any(t.get('stop') for t in timing)
         self.confirm('判讀完成', quality_summary(evs, cancelled, timing), ok='知道了', cancel=None,
                      warn=need, icon=None if need else '✓')
 

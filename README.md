@@ -86,10 +86,15 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 - 開始判讀前檢查位置存在；取消時只刪這次才建立的空資料夾（`_made_root`），使用者自己建的空「判讀結果」不刪。
 - 第 1 頁左欄：「判讀」區用 `side='bottom'` 先排、影片清單內下方幾行也先排，視窗最小（1200×760）時縮的是影片清單，不會把開始判讀、狀態列擠出畫面。
 
+## 攝影機位置改變就停止判讀（v1.0.11，修正清單 #71）
+
+- `_camera_check()` 偵測到 → 進行中的那一筆 `finish('camera')` → `self.camera_stop`；`process(info=)` 看到就停止，`info['camera']=dict(t, file, pos)`。GUI 把說明寫進該影片的 `timing['stop']`，品質摘要、Excel、results.json 都會出現。
+- **不可以重建背景後繼續判讀**：參考線、軌道範圍是固定像素位置（v1.0.10 的做法已撤回）。自動影像配準暫不做。
+
 ## GPT 第三輪檢查的修正（v1.0.10，修正清單 #66～#70）
 
 - `finish()`：事件還在就一律 `end_known=False`，含「正在等確認」（`pending_close`，`confirming=True`）。
-- **不再因為 `max_static` 結束事件**，只設 `static_alarm`（需確認）。取而代之的是 `_camera_check()`：`_exposure_calc` 順便算軌道以外的紋理相關 `_out_ncc`，< `CAM_NCC`（0.35）持續 `CAM_SEC`（5 秒）→ 結束進行中的那一筆（`incomplete='camera'`；畫面改變那一刻才開始的 → 不是列車），`restart(kind='camera')`，再用 `CAM_WARM`（10 秒）的畫面取中位數重建背景。**不要直接用偵測到的那一格當背景**（可能還有列車，背景會卡住）。
+- **不再因為 `max_static` 結束事件**，只設 `static_alarm`（需確認）。取而代之的是 `_camera_check()`：`_exposure_calc` 順便算軌道以外的紋理相關 `_out_ncc`，< `CAM_NCC`（0.35）持續 `CAM_SEC`（5 秒）→ 結束進行中的那一筆（`incomplete='camera'`；畫面改變那一刻才開始的 → 不是列車）。（v1.0.10 之後會重建背景繼續判讀；v1.0.11 起改成停止判讀，見上方。）
 - `process()`：下一支影片比上一支實際結尾早 > `OVERLAP_SEC`（2 秒）→ `TimeOrderError`。
 - 截圖：`start_known`／`end_known` 為 False 時叫「1第一畫面_車頭未確認」「3最後畫面_車尾未確認」。
 - **被否決或撤回的建議統一記在 `docs/修正清單.md` 最後的表，修改前先對照。**

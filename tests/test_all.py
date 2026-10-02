@@ -424,27 +424,7 @@ class TestRound3(unittest.TestCase):
         self.assertTrue(v[0]['need_check'])
         self.assertIn('長時間', v[0]['reason'])
 
-    def test67b_camera_moved_during_train(self):
-        """#67 列車經過時攝影機被碰歪（畫面整個移動）→ 那一筆在偵測到時結束（車尾未確認、備註寫攝影機），
-        之後來的列車要判讀得到（不可以整段卡成一筆，後面的列車全部漏掉）"""
-        d, f, exp = self.scene('a.avi', 260, trains=[dict(t0=150, d=1, speed=40), dict(t0=220, d=-1)],
-                               camera_shift=(151, 14, 9, 1.5), texture=3000)
-        evs, _ = self.run_files([f], [0.0])
-        v = self.valid(evs)
-        info = [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason'][:50]) for e in evs]
-        self.assertTrue(any(abs(e['start'] - 220) < 0.5 for e in v), info)
-        first = next(e for e in v if abs(e['start'] - 150) < 1.0)
-        self.assertFalse(first['end_known'], info)
-        self.assertIn('攝影機', first['reason'])
-        self.assertLess(first['end'], 200, info)
-
-    def test67c_idle_camera_moved(self):
-        """#67 沒有列車時攝影機被碰歪 → 不可以產生列車；之後的列車照常判讀"""
-        d, f, exp = self.scene('a.avi', 240, trains=[dict(t0=200, d=1)], camera_shift=(120, 14, 9, 1.5), texture=3000)
-        evs, _ = self.run_files([f], [0.0])
-        v = self.valid(evs)
-        self.assertEqual(len(v), 1, [(e['start'], e['end'], e['reason']) for e in v])
-        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.5)
+    # test67b／67c（攝影機被碰歪後重建背景繼續判讀）已由 v1.0.11 的 TestRound4.test71a／71b（停止判讀）取代（#71）
 
     def test68_time_jump_in_middle_file(self):
         """#68 事件跨 A、B、C，只有中間的 B 畫面時間跳動 → 也要標需確認"""
@@ -486,6 +466,53 @@ class TestRound3(unittest.TestCase):
         self.assertEqual(len(v), 2, [(e['start'], e['end']) for e in v])
         self.assertTrue(any('1第一畫面_車頭未確認' in s for s in v[0]['shots']), v[0]['shots'])
         self.assertTrue(any('3最後畫面_車尾未確認' in s for s in v[1]['shots']), v[1]['shots'])
+
+
+class TestRound4(unittest.TestCase):
+    """v1.0.11：攝影機位置改變 → 停止判讀（修正清單 #71）"""
+    scene = TestRound2.scene
+    valid = TestRound2.valid
+
+    def run_info(self, files, bases, prof=None):
+        info = {}
+        evs = core.number_events(core.process(files, bases, prof or core.Profile(), info=info))
+        return evs, info
+
+    def test71a_idle_camera_moved_stops(self):
+        """#71 沒有列車時攝影機被碰歪 → 偵測到、停止判讀，之後的列車不再分析；回報影片與時間"""
+        d, f, exp = self.scene('a.avi', 240, trains=[dict(t0=200, d=1)], camera_shift=(120, 14, 9, 1.5), texture=3000)
+        evs, info = self.run_info([f], [0.0])
+        self.assertIn('camera', info, info)
+        self.assertEqual(info['camera']['file'], f)
+        self.assertLess(abs(info['camera']['t'] - 120), 1.0, info)
+        self.assertEqual([e for e in self.valid(evs) if e['start'] > 121], [], [(e['start'], e['reason']) for e in evs])
+
+    def test71b_camera_moved_during_train_stops(self):
+        """#71 列車通過途中攝影機被碰歪 → 那一筆保留、車尾未確認、需確認；停止判讀，之後的列車不再分析"""
+        d, f, exp = self.scene('a.avi', 260, trains=[dict(t0=150, d=1, speed=40), dict(t0=220, d=-1)],
+                               camera_shift=(151, 14, 9, 1.5), texture=3000)
+        evs, info = self.run_info([f], [0.0])
+        v = self.valid(evs)
+        info2 = [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason'][:50]) for e in evs]
+        self.assertIn('camera', info, info2)
+        self.assertEqual(len(v), 1, info2)
+        self.assertLess(abs(v[0]['start'] - 150), 0.5)
+        self.assertFalse(v[0]['end_known']); self.assertTrue(v[0]['need_check'])
+        self.assertIn('攝影機位置', v[0]['reason'])
+
+    def test71c_no_false_camera_stop(self):
+        """#71 曝光變化、車燈、紅外線切換、陽光、一般列車 → 不可以誤判成攝影機移動"""
+        cases = [dict(seconds=60, trains=[dict(t0=20, d=1)], exposure=[(30, 45, 0.6)]),
+                 dict(seconds=40, blobs=[(10, 14, 350, 190, 60), (20, 23, 300, 150, 90)]),
+                 dict(seconds=60, ir_at=20, trains=[dict(t0=35, d=1)]),
+                 dict(seconds=60, local_light=[(10, 50, 1.35)], trains=[dict(t0=25, d=-1)]),
+                 dict(seconds=60, trains=[dict(t0=10, d=1, speed=40, length=800, y=(166, 188)),
+                                          dict(t0=20, d=-1, speed=40, length=800, y=(192, 214))])]
+        for kw in cases:
+            sec = kw.pop('seconds')
+            d, f, exp = self.scene('a.avi', sec, **kw)
+            evs, info = self.run_info([f], [0.0])
+            self.assertNotIn('camera', info, kw)
 
 
 class TestRound2Gui(unittest.TestCase):
@@ -534,6 +561,12 @@ class TestRound2Gui(unittest.TestCase):
 
 
 class TestExport(unittest.TestCase):
+    def test_noise_txt_midnight(self):
+        """#44 跨午夜的列車：一行，日期用車頭進入那天（使用者實測噪音分析程式可以接受）"""
+        b = dt.datetime(2023, 9, 18, 23, 59, 58).timestamp()
+        self.assertEqual(export.noise_lines([dict(start=b + 0.2, end=b + 4.6, valid=True)]),
+                         ['2023/09/18,23:59:58,00:00:03,10,FR,,A'])
+
     def test_noise_txt(self):
         d = tempfile.mkdtemp()
         b = dt.datetime(2023, 9, 18, 11, 1, 26).timestamp()
@@ -675,7 +708,9 @@ class TestSamples(unittest.TestCase):
                 self.assertTrue(r['ok'], (f, r))
                 self.assertGreaterEqual(r['support'], 0.95)
                 bases.append(r['offset'])
-            evs = [e for e in core.number_events(core.process(files, bases, core.Profile())) if e['valid']]
+            info = {}
+            evs = [e for e in core.number_events(core.process(files, bases, core.Profile(), info=info)) if e['valid']]
+            self.assertNotIn('camera', info, (keys, info))          # 真實樣本不可以誤判成攝影機移動（#71）
             got = [(core.fmt_time(e['start']), core.fmt_time(e['end']), e['direction']) for e in evs]
             self.assertEqual(len(got), len(exp), (keys, got))
             for g, x in zip(got, exp):

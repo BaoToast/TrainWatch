@@ -128,6 +128,7 @@ class Detector:
         self.start_kind = 'video'   # 一開始就有變化時的原因：video＝第一支影片開頭、gap＝錄影中斷後
         self.bg_note = ''       # 初始背景的說明（背景不確定時，這支影片的列車都標需確認）
         self.bg_note_file = None
+        self.camera_stop = None  # 偵測到攝影機位置改變：dict(t=畫面時間, file=影片, pos=影片內秒數)，判讀就此停止（#71）
         self.small = self.bg_small = self.out_mask = None   # 整個畫面縮小版（估計攝影機自動調亮度）
 
     def feed(self, t_abs: float, gray: np.ndarray, sat: float, file: str, pos: float, frame_bgr=None):
@@ -139,20 +140,7 @@ class Detector:
         gain = self._exposure(frame_bgr)
         if gain != 1.0:
             g = g / gain        # 攝影機自動調亮度（例如亮的列車經過後整個畫面變暗）→ 先還原再比較
-        if self._camera_check(t_abs, g, gain, file, pos):
-            return
-        if getattr(self, 'warm_until', None) is not None:
-            if len(self.warm_frames) < 80 and int(t_abs * 4) != int(getattr(self, '_warm_last', -1) * 4):
-                self.warm_frames.append(g * gain)
-                self._warm_last = t_abs
-            self.prev = g
-            if t_abs >= self.warm_until:
-                if len(self.warm_frames) >= 3:
-                    self.bg = np.median(np.stack(self.warm_frames), axis=0).astype(np.float32)
-                if self.small is not None:
-                    self.bg_small = self.small.copy()
-                self.warm_until, self.warm_frames = None, []
-                self.first_t = t_abs
+        if self.camera_stop or self._camera_check(t_abs, g, gain, file, pos):
             return
         diff = np.abs(g - self.bg)
         if self.prev is not None and self.prev.shape == g.shape:
@@ -263,13 +251,14 @@ class Detector:
     EXPO_SCALE = 8
     CAM_NCC = 0.35        # 軌道以外的畫面和背景的紋理相關低於這個值＝攝影機畫面整個改變（樣本最低：白天 0.83、夜間車燈 0.56）
     CAM_SEC = 5.0         # 持續幾秒才算（車燈、閃光只有一下子）
-    CAM_WARM = 10.0       # 攝影機畫面改變後，花幾秒重新建立背景（這段時間不判讀）
 
     def _camera_check(self, t_abs, g, gain, file, pos):
         """攝影機被碰歪、轉動：整個畫面（含軌道以外的樹、山、天空）都和背景不一樣，紋理相關很低。
         列車只會改變軌道那一帶，車燈照亮只是亮度變、而且很短。持續 CAM_SEC 秒就：
-        進行中的那一筆在畫面改變的那一刻結束（車尾未確認；如果是畫面改變才「開始」的，就不是列車），背景重建（#67）。
-        回傳 True＝這一格已處理完（重建背景），不再做後面的判斷"""
+        進行中的那一筆在畫面改變的那一刻結束（車尾未確認；如果是畫面改變才「開始」的，就不是列車），
+        然後**停止這次判讀**（self.camera_stop）：參考線、軌道範圍是固定的像素位置，攝影機動了就不再對準原本的
+        真實位置，不可以重建背景後繼續用（#71，v1.0.10 的「重建背景繼續判讀」已撤回）。
+        回傳 True＝已偵測到，process() 會停止"""
         ncc = getattr(self, '_out_ncc', None)
         if ncc is None or ncc >= self.CAM_NCC:
             self.cam_since = None
@@ -288,11 +277,7 @@ class Detector:
             c['camera_t'] = t0
             self.pending_close = None
             self.finish('camera')
-        self.restart(g * gain, '', kind='camera')
-        # 重新建立背景：接下來 CAM_WARM 秒的畫面取中位數（目前這一格可能還有列車的一部分，直接當背景會卡住）
-        self.warm_until, self.warm_frames = t_abs + self.CAM_WARM, []
-        self.cam_since = None
-        self.camera_events = getattr(self, 'camera_events', []) + [t0]
+        self.camera_stop = dict(t=t0, file=f0, pos=p0)
         return True
 
     def _exposure(self, frame_bgr):
@@ -339,7 +324,7 @@ class Detector:
         return self.events
 
     def restart(self, bg, note='', kind='gap'):
-        """錄影中斷（gap）或攝影機畫面改變（camera）後重新開始：背景、上一格、最近的歷史都不延續（#49、#67）"""
+        """錄影中斷（gap）後重新開始：背景、上一格、最近的歷史都不延續（#49）"""
         self.bg = bg
         self.bg_small = None
         self.prev = None
@@ -462,8 +447,8 @@ class Detector:
         ev['start_known'] = not c.get('at_file_start')
         if c.get('camera_start'):
             ev['valid'] = False
-            reasons.insert(0, '攝影機畫面在 %s 整個改變（可能被碰到或轉動），不是列車；程式用之後 %d 秒的畫面重新建立背景（這段時間沒有判讀）'
-                           % (fmt_time(c['camera_t']), self.CAM_WARM))
+            reasons.insert(0, '攝影機位置在 %s 改變（可能被碰到或轉動），這一筆是畫面改變造成的，不是列車；判讀在這裡停止'
+                           % fmt_time(c['camera_t']))
         if ev['valid']:
             if not agree:
                 ev['need_check'] = True
@@ -478,9 +463,9 @@ class Detector:
                 items.append('車尾離開後確認時間不足（車尾未確認）')
             elif c.get('incomplete') == 'camera':
                 ev['need_check'] = True
-                reasons.append('車尾未確認：攝影機畫面在 %s 整個改變（可能被碰到或轉動），程式在這裡結束這一筆，'
-                               '並用之後 %d 秒的畫面重新建立背景（這段時間沒有判讀）' % (fmt_time(c['camera_t']), self.CAM_WARM))
-                items.append('攝影機畫面改變（車尾未確認）')
+                reasons.append('車尾未確認：攝影機位置在 %s 改變（可能被碰到或轉動），車尾時間無法確認；判讀在這裡停止'
+                               % fmt_time(c['camera_t']))
+                items.append('攝影機位置改變（車尾未確認）')
             elif c.get('incomplete') == 'video_end':
                 ev['need_check'] = True
                 reasons.append('車尾未確認：影片結束時列車仍在參考線上（車尾時間是影片最後一格 %s）' % fmt_time(c['end']))
@@ -512,11 +497,7 @@ class Detector:
             if eshift > 0:
                 reasons.append('參考線到 %s 還有微小變化（可能是車尾後光線或背景改變），車尾時間取變化明顯的時刻（往前 %.1f 秒）'
                                % (fmt_time(last_change), eshift))
-            if c.get('at_file_start') == 'camera':
-                ev['need_check'] = True
-                reasons.append('攝影機畫面改變、重新建立背景後一開始就有變化（車頭時間不確定）')
-                items.append('攝影機畫面改變後一開始就有列車（車頭未確認）')
-            elif c.get('at_file_start') == 'gap':
+            if c.get('at_file_start') == 'gap':
                 ev['need_check'] = True
                 reasons.append('錄影中斷後，下一支影片一開始就有變化（列車可能在錄影恢復前就已到達，車頭時間是影片開頭）')
                 items.append('錄影中斷後一開始就有列車（車頭未確認）')
@@ -560,14 +541,15 @@ def draw_overlay(frame, profile: Profile, color_ref=(0, 0, 255), color_track=(0,
 
 
 def process(files: List[str], bases: List[float], profile: Profile,
-            progress: Callable[[float, str], None] = None, cancel: Callable[[], bool] = None):
+            progress: Callable[[float, str], None] = None, cancel: Callable[[], bool] = None, info: dict = None):
     """依序處理多個檔案（同一攝影機）。bases：每個檔案「影片內 0 秒」對應的畫面時間（epoch 秒，由 osd.calibrate 算出）。
-    回傳事件 list（dict）"""
+    回傳事件 list（dict）。info（dict）：偵測到攝影機位置改變時填入 info['camera']＝dict(t, file, pos)，
+    判讀在那裡停止，已完成的事件照常回傳（#71）"""
     det = None
     durs = []
     for f in files:
-        info = video_info(f)
-        durs.append((info or {}).get('dur') or 600)
+        vi = video_info(f)
+        durs.append((vi or {}).get('dur') or 600)
     total = sum(durs) or 1
     done = 0.0
     prev_end = None                       # 上一支影片最後一格的畫面時間（實際讀到的，不用檔頭的長度）
@@ -612,6 +594,11 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 sat = float(cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
             det.feed(base + pos, gray, sat, f, pos, fr)
             k += 1
+            if det.camera_stop:                    # 攝影機位置改變：停止判讀（#71）
+                cap.release()
+                if info is not None:
+                    info['camera'] = dict(det.camera_stop)
+                return det.finish('camera')
             if progress and k % 150 == 0:
                 progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
             if cancel and k % 30 == 0 and cancel():
