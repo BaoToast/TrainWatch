@@ -227,8 +227,8 @@ class TestGuiHelpers(unittest.TestCase):
         self.assertEqual(gui.result_root(os.path.join('E:', os.sep, '報告'), v), os.path.join('E:', os.sep, '報告', '判讀結果'))
         self.assertEqual(gui.result_root(os.path.join('E:', os.sep, '判讀結果'), v), os.path.join('E:', os.sep, '判讀結果'))
         with tempfile.TemporaryDirectory() as d:
-            old = os.environ.get('TRAINWATCH_HOME')
-            os.environ['TRAINWATCH_HOME'] = d
+            old = os.environ.get('TRAINWATCH_DATA')
+            os.environ['TRAINWATCH_DATA'] = d
             try:
                 self.assertEqual(gui.load_settings(), {})
                 self.assertTrue(gui.save_settings({'result_location': os.path.join(d, '報告')}))
@@ -236,9 +236,42 @@ class TestGuiHelpers(unittest.TestCase):
                 self.assertTrue(os.path.exists(os.path.join(d, '程式設定.json')))
             finally:
                 if old is None:
-                    os.environ.pop('TRAINWATCH_HOME')
+                    os.environ.pop('TRAINWATCH_DATA')
                 else:
-                    os.environ['TRAINWATCH_HOME'] = old
+                    os.environ['TRAINWATCH_DATA'] = old
+
+    def test_import_old_settings(self):
+        """換新版：從舊版程式資料夾（或直接選「監測站設定」資料夾）找到設定並複製；同名的不覆蓋"""
+        try:
+            from trainwatch import gui
+        except Exception as e:
+            self.skipTest(str(e))
+        import tempfile, json as _j
+        with tempfile.TemporaryDirectory() as d:
+            old = os.path.join(d, '列車通過判讀_v1.0.4')
+            os.makedirs(os.path.join(old, '監測站設定'))
+            for n in ('甲站', '乙站'):
+                with open(os.path.join(old, '監測站設定', n + '.json'), 'w', encoding='utf-8') as fh:
+                    fh.write('{"name": "%s"}' % n)
+            with open(os.path.join(old, '監測站設定', '_上次使用.txt'), 'w', encoding='utf-8') as fh:
+                fh.write('乙站')
+            with open(os.path.join(old, '程式設定.json'), 'w', encoding='utf-8') as fh:
+                _j.dump({'result_location': 'E:\\報告'}, fh)
+            for pick in (old, os.path.join(old, '監測站設定')):
+                prof, st = gui.find_old_settings(pick)
+                self.assertEqual(prof, os.path.join(old, '監測站設定'))
+                self.assertEqual(st, os.path.join(old, '程式設定.json'))
+            self.assertEqual(gui.find_old_settings(d), (None, None))
+            new = os.path.join(d, '文件', '列車通過判讀設定')
+            os.makedirs(os.path.join(new, '監測站設定'))
+            with open(os.path.join(new, '監測站設定', '甲站.json'), 'w', encoding='utf-8') as fh:
+                fh.write('{"name": "新的甲站"}')
+            copied, skipped, st_done = gui.import_settings(*gui.find_old_settings(old), new)
+            self.assertEqual(copied, ['乙站']); self.assertEqual(skipped, ['甲站']); self.assertTrue(st_done)
+            with open(os.path.join(new, '監測站設定', '甲站.json'), encoding='utf-8') as fh:
+                self.assertIn('新的甲站', fh.read())          # 同名的沒有被舊版蓋掉
+            self.assertTrue(os.path.exists(os.path.join(new, '程式設定.json')))
+            self.assertEqual(gui.profile_names_in(os.path.join(new, '監測站設定')), ['乙站', '甲站'])
 
 
 def _expected():

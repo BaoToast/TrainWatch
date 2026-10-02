@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import datetime as dt
 import json
+import shutil
 import os
 import queue
 import subprocess
@@ -19,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.7'
+VERSION = '1.0.8'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -37,7 +38,7 @@ PARAM_RANGE = dict(on_level=(3, 100), off_level=(1, 99), pixel_diff=(3, 120), me
 
 
 def app_dir():
-    """程式的最上層資料夾（「啟動列車通過判讀.bat」所在處），監測站設定存在這裡"""
+    """程式的最上層資料夾（「啟動列車通過判讀.bat」所在處）。v1.0.7 以前監測站設定存在這裡"""
     home = os.environ.get('TRAINWATCH_HOME')
     if home and os.path.isdir(home):
         return os.path.abspath(home)
@@ -51,9 +52,85 @@ STATUS_EMPTY = '請先加入影片，再在右邊畫參考線與軌道範圍。'
 STATUS_READY = '影片已加入。畫好框線後，按「開始判讀」。'
 
 
+DATA_FOLDER = '列車通過判讀設定'
+PROFILE_FOLDER = '監測站設定'
+SETTINGS_FILE = '程式設定.json'
+LAST_FILE = '_上次使用.txt'
+ASKED_FILE = '_已詢問匯入舊版設定.txt'
+
+
+def documents_dir():
+    """使用者的「文件」資料夾（Windows 會照實際位置，例如被移到 D 槽或 OneDrive）"""
+    if sys.platform.startswith('win'):
+        try:
+            import ctypes
+            buf = ctypes.create_unicode_buffer(260)
+            if ctypes.windll.shell32.SHGetFolderPathW(None, 5, None, 0, buf) == 0 and os.path.isdir(buf.value):
+                return buf.value
+        except Exception:
+            pass
+    d = os.path.join(os.path.expanduser('~'), 'Documents')
+    return d if os.path.isdir(d) else os.path.expanduser('~')
+
+
+def data_dir():
+    """監測站設定與程式設定的固定位置（v1.0.8 起）：文件\\列車通過判讀設定。
+    放在程式資料夾外面，換新版不用再複製。TRAINWATCH_DATA 可指定別處（測試用）"""
+    d = os.environ.get('TRAINWATCH_DATA')
+    return os.path.abspath(d) if d else os.path.join(documents_dir(), DATA_FOLDER)
+
+
 def settings_path():
-    """程式設定（目前只有結果存放的預設位置）。程式資料夾不能寫入時改存到使用者資料夾"""
-    return os.path.join(app_dir(), '程式設定.json')
+    """程式設定（目前只有結果存放的預設位置）"""
+    return os.path.join(data_dir(), SETTINGS_FILE)
+
+
+def profile_names_in(folder):
+    try:
+        return sorted(f[:-5] for f in os.listdir(folder) if f.lower().endswith('.json') and not f.startswith('_'))
+    except OSError:
+        return []
+
+
+def find_old_settings(folder):
+    """使用者選的舊版資料夾裡，監測站設定在哪裡。可以選程式資料夾，也可以直接選「監測站設定」資料夾。
+    回傳 (監測站設定資料夾或 None, 程式設定.json 或 None)"""
+    folder = os.path.abspath(folder)
+    prof = None
+    for d in (os.path.join(folder, PROFILE_FOLDER), folder, os.path.join(folder, DATA_FOLDER, PROFILE_FOLDER)):
+        if profile_names_in(d):
+            prof = d
+            break
+    cands = [os.path.join(folder, SETTINGS_FILE), os.path.join(folder, DATA_FOLDER, SETTINGS_FILE)]
+    if prof == folder:                      # 直接選了「監測站設定」資料夾 → 程式設定在上一層
+        cands.append(os.path.join(os.path.dirname(folder), SETTINGS_FILE))
+    st = next((f for f in cands if os.path.isfile(f)), None)
+    return prof, st
+
+
+def import_settings(src_prof, src_settings, dst_root):
+    """把舊版的監測站設定（與程式設定）複製到 dst_root。已經有同名的監測站不覆蓋。
+    回傳 (複製了的監測站名稱, 因為同名沒有複製的名稱, 程式設定有沒有複製)"""
+    dst_prof = os.path.join(dst_root, PROFILE_FOLDER)
+    os.makedirs(dst_prof, exist_ok=True)
+    copied, skipped = [], []
+    had = set(profile_names_in(dst_prof))
+    if src_prof and os.path.abspath(src_prof) != os.path.abspath(dst_prof):
+        for name in profile_names_in(src_prof):
+            if name in had:
+                skipped.append(name)
+                continue
+            shutil.copy2(os.path.join(src_prof, name + '.json'), os.path.join(dst_prof, name + '.json'))
+            copied.append(name)
+        last = os.path.join(src_prof, LAST_FILE)
+        if os.path.isfile(last) and not had:
+            shutil.copy2(last, os.path.join(dst_prof, LAST_FILE))
+    st_done = False
+    dst_st = os.path.join(dst_root, SETTINGS_FILE)
+    if src_settings and os.path.isfile(src_settings) and not os.path.exists(dst_st):
+        shutil.copy2(src_settings, dst_st)
+        st_done = True
+    return copied, skipped, st_done
 
 
 def load_settings():
@@ -70,6 +147,10 @@ def load_settings():
 
 def save_settings(d):
     txt = json.dumps(d, ensure_ascii=False, indent=2)
+    try:
+        os.makedirs(data_dir(), exist_ok=True)
+    except OSError:
+        pass
     for p in (settings_path(), os.path.join(os.path.expanduser('~'), '列車通過判讀_程式設定.json')):
         try:
             with open(p, 'w', encoding='utf-8') as fh:
@@ -211,16 +292,19 @@ class App:
         self._seek_job = None
         self.mode = tk.StringVar(value='ref')
         self.show_excluded = tk.BooleanVar(value=False)
+        self.data_root = data_dir()
+        self.prof_dir = os.path.join(self.data_root, PROFILE_FOLDER)
+        try:
+            os.makedirs(self.prof_dir, exist_ok=True)
+        except OSError:      # 「文件」不能寫入 → 改存到使用者資料夾
+            self.data_root = os.path.join(os.path.expanduser('~'), DATA_FOLDER)
+            self.prof_dir = os.path.join(self.data_root, PROFILE_FOLDER)
+            os.makedirs(self.prof_dir, exist_ok=True)
+        self.migrated = self._migrate_from_app_dir()
         self.settings = load_settings()
         d = self.settings.get('result_location')
         self.out_default = d if isinstance(d, str) and d else None   # None＝影片旁邊
         self.out_location = self.out_default                            # 這次要用的位置
-        self.prof_dir = os.path.join(app_dir(), '監測站設定')
-        try:
-            os.makedirs(self.prof_dir, exist_ok=True)
-        except OSError:      # 程式放在不能寫入的地方（例如 Program Files）→ 改存到使用者資料夾
-            self.prof_dir = os.path.join(os.path.expanduser('~'), '列車通過判讀_監測站設定')
-            os.makedirs(self.prof_dir, exist_ok=True)
 
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill='both', expand=True, padx=6, pady=6)
@@ -236,6 +320,8 @@ class App:
         self._build_tab2()
         self._load_last_profile()
         root.protocol('WM_DELETE_WINDOW', self.on_close)
+        if os.environ.get('CI') != 'true':      # GitHub Actions 的自動測試不要跳出詢問視窗
+            root.after(500, self._first_run_check)
         root.after(150, self._poll)
 
     def _on_wheel(self, e):
@@ -482,10 +568,95 @@ class App:
                      '修改完記得按上方「儲存修改並重新輸出 Excel」。'):
             ttk.Label(rf, style='Hint.TLabel', text=line).pack(fill='x', pady=(1, 0))
 
+    # ------------------------------------------------------------ 設定的位置與匯入舊版
+    def _migrate_from_app_dir(self):
+        """舊版把設定放在程式資料夾裡。新位置還沒有設定、程式資料夾裡有（例如使用者照舊複製過來）→ 自動搬過去。
+        程式資料夾裡的「監測站設定」之後不再使用，放一個說明檔指向新位置"""
+        old_prof = os.path.join(app_dir(), PROFILE_FOLDER)
+        res = None
+        if not profile_names_in(self.prof_dir) and os.path.abspath(old_prof) != os.path.abspath(self.prof_dir):
+            src_st = os.path.join(app_dir(), SETTINGS_FILE)
+            if profile_names_in(old_prof) or os.path.isfile(src_st):
+                try:
+                    res = import_settings(old_prof, src_st, self.data_root)
+                except OSError:
+                    res = None
+        if os.path.isdir(old_prof) and os.path.abspath(old_prof) != os.path.abspath(self.prof_dir):
+            try:
+                with open(os.path.join(old_prof, '這個資料夾已不使用.txt'), 'w', encoding='utf-8') as fh:
+                    fh.write('從 v1.0.8 起，監測站設定改存在：\n%s\n\n換新版時會自動沿用，不用再複製這個資料夾。\n' % self.prof_dir)
+            except OSError:
+                pass
+        return res
+
+    def _first_run_check(self):
+        try:
+            if self.migrated and (self.migrated[0] or self.migrated[2]):
+                self.var_status.set('已把程式資料夾裡的設定搬到「文件\\%s」，以後換新版會自動沿用。' % DATA_FOLDER)
+                return
+            asked = os.path.join(self.data_root, ASKED_FILE)
+            if self._profile_names() or os.path.exists(asked):
+                return
+            done = False
+            while True:
+                if not self.confirm('匯入舊版設定',
+                                    '找不到監測站設定（參考線、軌道範圍、時間字幕位置等）。\n\n'
+                                    '以前用過舊版：請按「選擇舊版資料夾…」，\n'
+                                    '選舊版「啟動列車通過判讀.bat」所在的資料夾，\n設定會自動複製過來。\n\n'
+                                    '設定現在改存在「文件\\%s」，\n以後換新版會自動沿用，只要匯入這一次。\n\n'
+                                    '第一次使用、沒有舊版：請按「重新設定」。' % DATA_FOLDER,
+                                    ok='選擇舊版資料夾…', cancel='重新設定'):
+                    break
+                if self.import_old(ask_again=True):
+                    done = True
+                    break
+            with open(asked, 'w', encoding='utf-8') as fh:
+                fh.write('已詢問過（%s）。要再匯入，請按「進階…」裡的「匯入舊版設定…」。\n'
+                         % ('已匯入' if done else '選擇重新設定'))
+        except (tk.TclError, OSError):
+            pass
+
+    def import_old(self, ask_again=False):
+        """選舊版資料夾，把監測站設定複製過來。成功回傳 True"""
+        d = filedialog.askdirectory(title='選擇舊版的程式資料夾（「啟動列車通過判讀.bat」所在的資料夾）', mustexist=True)
+        if not d:
+            return False
+        prof, st = find_old_settings(d)
+        if not prof and not st:
+            messagebox.showwarning(APP, '這個資料夾裡找不到監測站設定：\n%s\n\n請選「啟動列車通過判讀.bat」所在的資料夾，'
+                                   '或直接選裡面的「%s」資料夾。' % (d, PROFILE_FOLDER))
+            return False
+        try:
+            copied, skipped, st_done = import_settings(prof, st, self.data_root)
+        except OSError as e:
+            messagebox.showerror(APP, '複製設定失敗：%s' % e)
+            return False
+        if st_done:
+            self.settings = load_settings()
+            v = self.settings.get('result_location')
+            self.out_default = self.out_location = v if isinstance(v, str) and v else None
+            self.update_out_location()
+        self.cb_prof.configure(values=self._profile_names())
+        if copied:
+            self._load_last_profile()
+            if not self.cb_prof.get():
+                self.load_profile(copied[0])
+        msg = []
+        if copied:
+            msg.append('已匯入 %d 個監測站：%s' % (len(copied), '、'.join(copied)))
+        if skipped:
+            msg.append('已經有同名的，沒有覆蓋：%s' % '、'.join(skipped))
+        if st_done:
+            msg.append('已匯入結果存放的預設位置。')
+        if not msg:
+            msg.append('沒有需要匯入的設定（都已經有了）。')
+        messagebox.showinfo(APP, '\n'.join(msg) + '\n\n設定存在：\n%s' % self.data_root)
+        return bool(copied or skipped or st_done)
+
     # ------------------------------------------------------------ 監測站設定
     def _profile_names(self):
         try:
-            return sorted(f[:-5] for f in os.listdir(self.prof_dir) if f.lower().endswith('.json'))
+            return profile_names_in(self.prof_dir)
         except OSError:
             return []
 
@@ -627,7 +798,21 @@ class App:
                 v.set(str(getattr(d, k)))
             vf.set(d.osd_format)
             vc.set(d.make_clips)
-        r = ttk.Frame(w); r.grid(row=n + 4, column=0, columnspan=3, pady=(8, 10))
+        box = ttk.LabelFrame(w, text='設定存放位置（所有監測站共用）')
+        box.grid(row=n + 4, column=0, columnspan=3, sticky='we', padx=10, pady=(10, 0))
+        ttk.Label(box, text=self.data_root, foreground='#1060c0').pack(anchor='w', padx=8, pady=(4, 0))
+        ttk.Label(box, style='Hint.TLabel', text='換新版會自動沿用。換電腦或要合併其他電腦的設定，請按「匯入舊版設定…」。').pack(anchor='w', padx=8)
+        rb = ttk.Frame(box); rb.pack(anchor='w', padx=8, pady=(4, 8))
+        def _imp():
+            w.grab_release()
+            self.import_old()
+            try:
+                w.grab_set()
+            except tk.TclError:
+                pass
+        ttk.Button(rb, text='匯入舊版設定…', command=_imp).pack(side='left')
+        ttk.Button(rb, text='開啟設定資料夾', command=lambda: open_path(self.data_root)).pack(side='left', padx=(6, 0))
+        r = ttk.Frame(w); r.grid(row=n + 5, column=0, columnspan=3, pady=(8, 10))
         ttk.Button(r, text='確定', command=ok).pack(side='left', padx=4)
         ttk.Button(r, text='恢復預設', command=reset).pack(side='left', padx=4)
         ttk.Button(r, text='取消', command=w.destroy).pack(side='left', padx=4)
@@ -1562,9 +1747,9 @@ class App:
         def done(v):
             res['v'] = v
             w.destroy()
-        b_cancel = ttk.Button(bar, text=cancel, width=10, command=lambda: done(False))
+        b_cancel = ttk.Button(bar, text=cancel, width=max(10, len(cancel) * 2 + 2), command=lambda: done(False))
         b_cancel.pack(side='right')
-        b_ok = ttk.Button(bar, text=ok, width=10, command=lambda: done(True))
+        b_ok = ttk.Button(bar, text=ok, width=max(10, len(ok) * 2 + 2), command=lambda: done(True))
         b_ok.pack(side='right', padx=(0, 8))
         w.protocol('WM_DELETE_WINDOW', lambda: done(False))
         w.bind('<Escape>', lambda e: done(False))

@@ -9,7 +9,7 @@ Windows 免安裝版由 GitHub Actions 自動打包（`.github/workflows/build.y
 列車通過判讀_v1.0.1/
   啟動列車通過判讀.bat   ← packaging/start.bat（只能用 ASCII：cmd 以系統字碼頁讀 .bat）
   使用說明.txt
-  監測站設定/
+  監測站設定/            ← v1.0.8 起不再使用（build.yml 仍會建立；程式會在裡面放「這個資料夾已不使用.txt」）
   runtime/               ← Python 官方 embeddable 3.11.9＋從同版本完整 Python 複製的 tkinter＋site-packages
   app/                   ← main.py、trainwatch/
 ```
@@ -82,9 +82,16 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 ## 結果資料夾位置（v1.0.6）
 
 - `<存放位置>/判讀結果/<監測站>_<YYYYMMDD_HHMMSS>/`；`gui.result_root(location, first_video)`：location＝None 為第一支影片的資料夾；選的資料夾本身叫「判讀結果」就不再多包一層。
-- 預設位置存在 `app_dir()/程式設定.json`（`{"result_location": 路徑或 null}`），寫不進去改存使用者資料夾 `列車通過判讀_程式設定.json`。`out_location`（這次）與 `out_default`（預設）分開，「只用這一次」不寫檔。
+- 預設位置存在 `data_dir()/程式設定.json`（v1.0.7 以前在 `app_dir()`）（`{"result_location": 路徑或 null}`），寫不進去改存使用者資料夾 `列車通過判讀_程式設定.json`。`out_location`（這次）與 `out_default`（預設）分開，「只用這一次」不寫檔。
 - 開始判讀前檢查位置存在；取消時只刪這次才建立的空資料夾（`_made_root`），使用者自己建的空「判讀結果」不刪。
 - 第 1 頁左欄：「判讀」區用 `side='bottom'` 先排、影片清單內下方幾行也先排，視窗最小（1200×760）時縮的是影片清單，不會把開始判讀、狀態列擠出畫面。
+
+## 設定的位置（v1.0.8）
+
+- `gui.data_dir()`＝「文件」（Windows 用 `SHGetFolderPathW(CSIDL_PERSONAL)`，資料夾被搬到 D 槽／OneDrive 也找得到）`\列車通過判讀設定`，裡面是 `監測站設定\*.json`、`_上次使用.txt`、`程式設定.json`、`_已詢問匯入舊版設定.txt`。測試用 `TRAINWATCH_DATA` 指定別處。
+- 啟動時：新位置沒有監測站、程式資料夾的 `監測站設定` 有 → 自動複製過去（`_migrate_from_app_dir`）。都沒有、也沒問過 → 問一次「選擇舊版資料夾…／重新設定」（`_first_run_check`，`CI=true` 時不問，GitHub Actions 的視窗測試才不會卡住）。
+- `find_old_settings()` 接受舊版程式資料夾或直接選「監測站設定」資料夾；`import_settings()` 同名不覆蓋。
+- **build.yml 沒有改**：打包時仍建立空的 `監測站設定`，而且 GUI 測試之後的 `Get-ChildItem "$env:DST/監測站設定"` 需要這個資料夾存在（`$ErrorActionPreference='Stop'`），所以程式不可以刪掉它。
 
 ## 視窗縮小（v1.0.7）
 
