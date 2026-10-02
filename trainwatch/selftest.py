@@ -49,22 +49,26 @@ def make_video(path, seconds=40.0, trains=((5.0, +1), (22.0, -1)), speed=120.0, 
     return [(t0, t0 + length / speed, d) for t0, d in trains]   # 預期 (車頭到達, 車尾離開, 方向)
 
 
-def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2):
+def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2, vertical=False, ir_at=None, camera_shift=None, texture=400):
     """較完整的假影片（驗收測試用）。
     trains：dict(t0=車頭碰到參考線 x=350 的秒數, d=+1 往右／-1 往左, speed=像素／秒, length=車長像素,
                  y=(上, 下), stops=[(開始停的秒數, 停多久), …], car=每節車廂長, gap=車廂間空隙像素)
     exposure：[(開始秒, 結束秒, 亮度倍率)]（整個畫面一起變亮／變暗，模擬攝影機自動調亮度）
     blobs：[(開始秒, 結束秒, x, y, 半徑)]（亮光，模擬車燈照射）
     local_light：[(開始秒, 結束秒, 亮度倍率)]（只有軌道一帶 y=140～240 變亮／變暗，模擬陽光、雲影；過渡 2 秒）
+    vertical：True＝整個畫面轉 90 度（360×640，軌道上下走向，列車往下／往上；設定用 VERTICAL_PROFILE）
+    ir_at：從這一秒起畫面變成紅外線模式（黑白、對比和亮度都不同），模擬傍晚攝影機切換
+    camera_shift：(秒, dx, dy, 轉幾度)，從這一秒起整個畫面移動／轉動，模擬攝影機被碰歪
+    texture：背景上的圓點數（越多紋理越密，像真實的樹叢、電線桿）
     回傳每列車預期的 (車頭到達, 車尾離開)"""
     import cv2
     rng = np.random.default_rng(seed)
     bg = np.full((H, W, 3), 110, np.uint8)
     bg[:, :, 1] = 130
-    for _ in range(400):
+    for _ in range(texture):
         x, y = rng.integers(0, W), rng.integers(0, H)
         cv2.circle(bg, (int(x), int(y)), int(rng.integers(2, 8)), tuple(int(v) for v in rng.integers(40, 200, 3)), -1)
-    wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'MJPG'), FPS, (W, H))
+    wr = cv2.VideoWriter(path, cv2.VideoWriter_fourcc(*'MJPG'), FPS, (H, W) if vertical else (W, H))
     if not wr.isOpened():
         raise RuntimeError('無法建立測試影片')
 
@@ -110,15 +114,36 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), 
             if a_ <= t <= b_:
                 f = fac
         out = fr.astype(np.float32) * f + rng.normal(0, 2.5, fr.shape)
-        wr.write(np.clip(out, 0, 255).astype(np.uint8))
+        out = np.clip(out, 0, 255).astype(np.uint8)
+        if ir_at is not None and t >= ir_at:
+            g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+            g = np.clip((g - 110) * 1.6 + 150, 0, 255).astype(np.uint8)     # 紅外線：黑白、比較亮、對比不同
+            out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
+        if camera_shift is not None and t >= camera_shift[0]:
+            _t, dx, dy, ang = camera_shift
+            M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, 1.0)
+            M[0, 2] += dx; M[1, 2] += dy
+            out = cv2.warpAffine(out, M, (W, H), borderMode=cv2.BORDER_REFLECT)
+        if vertical:
+            out = np.ascontiguousarray(out.transpose(1, 0, 2))
+        wr.write(out)
     wr.release()
     return expect
 
 
-def run_scene(path, seconds, **kw):
-    """產生場景並用正式流程判讀；回傳 (有效事件[(開始, 結束, 方向, 備註)], 預期)"""
+def vertical_profile():
+    """make_scene(vertical=True) 用的監測站設定（原本的參考線、軌道範圍 x、y 對調）"""
+    p = core.Profile()
+    p.ref_line = [[y, x] for x, y in p.ref_line]
+    x0, y0, x1, y1 = p.track_rect
+    p.track_rect = [y0, x0, y1, x1]
+    return p
+
+
+def run_scene(path, seconds, profile=None, **kw):
+    """產生場景並用正式流程判讀；回傳 (有效事件[(開始, 結束, 方向, 備註, 需確認)], 預期)"""
     expect = make_scene(path, seconds, **kw)
-    prof = core.Profile()
+    prof = profile or (vertical_profile() if kw.get('vertical') else core.Profile())
     base = dt.datetime(2026, 1, 1, 8, 0, 0).timestamp()
     evs = core.number_events(core.process([path], [base], prof))
     got = [(round(e['start'] - base, 2), round(e['end'] - base, 2), e['direction'], e['reason'], e.get('need_check'))

@@ -17,7 +17,8 @@ DIRS = ['往右', '往左', '往上', '往下', '無法判定']
 
 KEEP = ('no', 'start', 'end', 'first_change', 'last_change', 'start_file', 'end_file', 'start_pos', 'end_pos',
         'coverage', 'both', 'peak', 'direction', 'dir_on', 'dir_off', 'dir_confident', 'night', 'valid', 'reason',
-        'need_check', 'shots', 'clip', 'train_type', 'crossing', 'note', 'checked')
+        'need_check', 'shots', 'clip', 'train_type', 'crossing', 'note', 'checked',
+        'end_known', 'start_known', 'media_tag', 'peak_t', 'peak_file', 'peak_pos', 'start_shift', 'end_shift', 'check_items')
 
 
 def clean(ev):
@@ -27,6 +28,9 @@ def clean(ev):
     for k in ('crossing', 'checked', 'need_check', 'valid', 'night', 'dir_confident'):
         d[k] = bool(d.get(k))
     d['shots'] = d.get('shots') or []
+    d['end_known'] = ev.get('end_known') is not False          # v1.0.8 以前的結果沒有這個欄位＝已確認
+    d['start_known'] = ev.get('start_known') is not False
+    d['check_items'] = list(ev.get('check_items') or [])
     return d
 
 

@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.8'
+VERSION = '1.0.10'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -225,6 +225,68 @@ class ScrollArea(ttk.Frame):
                 self.cv.xview_scroll(units, 'units')
         elif self.vs.winfo_ismapped():
             self.cv.yview_scroll(units, 'units')
+
+
+def final_order(files, timing):
+    """正式讀完畫面時間後：依時間排序（判讀一定要照時間順序）、找出重疊的影片。
+    回傳 (files, timing, 排序說明, 重疊清單)"""
+    idx = list(range(len(files)))
+    srt = sorted(idx, key=lambda i: (timing[i].get('offset') is None, timing[i].get('offset') or 0))
+    note = ''
+    if srt != idx:
+        note = '正式讀取畫面時間後，影片順序和清單不同，\n已依畫面時間排序後判讀。'
+    files = [files[i] for i in srt]
+    timing = [timing[i] for i in srt]
+    overlap = []
+    for k in range(1, len(files)):
+        a, b = timing[k - 1].get('offset'), timing[k].get('offset')
+        if a is None or b is None:
+            continue
+        dur = (core.video_info(files[k - 1]) or {}).get('dur') or 0.0
+        if b < a + dur - 2.0:
+            overlap.append('%s 和 %s 重疊約 %d 秒' % (os.path.basename(files[k - 1]), os.path.basename(files[k]), a + dur - b))
+    return files, timing, note, overlap
+
+
+def mark_time_jumps(evs, files, timing):
+    """正式校正發現畫面時間中途跳動的影片：這支影片裡的列車標需人工確認（#52）"""
+    jumpy = {f: t.get('msg') for f, t in zip(files, timing) if t.get('msg')}
+    idx = {f: i for i, f in enumerate(files)}
+    for e in evs:
+        a, b = idx.get(e.get('start_file')), idx.get(e.get('end_file'))
+        passed = files[a:b + 1] if a is not None and b is not None else [e.get('start_file'), e.get('end_file')]
+        msg = next((jumpy[f] for f in passed if f in jumpy), None)      # 事件經過的每一支影片都要看（#68）
+        if msg and e.get('valid'):
+            e['need_check'] = True
+            e['reason'] = (e.get('reason', '') + '；這支影片的畫面時間有跳動（%s），時間可能不準' % msg).strip('；')
+            e.setdefault('check_items', []).append('影片的畫面時間有跳動')
+
+
+def quality_summary(evs, cancelled=False, timing=()):
+    """判讀完成的品質摘要文字（#61）"""
+    valid = [e for e in evs if e.get('valid')]
+    need = [e for e in valid if e.get('need_check')]
+    lines = ['%s判讀完成。' % ('已取消，部分' if cancelled else ''),
+             '列車 %d 筆、已排除 %d 筆。' % (len(valid), len(evs) - len(valid)),
+             '需人工確認 %d 筆%s' % (len(need), '，其中：' if need else '。')]
+    cnt = {}
+    for e in need:
+        for it in (e.get('check_items') or ['其他（請看備註）']):
+            cnt[it] = cnt.get(it, 0) + 1
+    for it, n in sorted(cnt.items(), key=lambda x: -x[1]):
+        lines.append('　・%s：%d 筆' % (it, n))
+    no_end = sum(1 for e in valid if e.get('end_known') is False)
+    if no_end:
+        lines.append('')
+        lines.append('注意：%d筆「車尾未確認」，離開時間是程式最後看到列車的時間，\n匯入噪音分析程式前請先確認。' % no_end)
+    notes = sorted({t.get('note') for t in timing if t.get('note')})
+    if notes:
+        lines.append('')
+        lines.extend(notes)
+    if need:
+        lines.append('')
+        lines.append('需人工確認的在第2頁以淡黃色標示，原因寫在「備註」欄。\n一筆可能同時有好幾個原因。')
+    return '\n'.join(lines)
 
 
 def open_path(p):
@@ -534,8 +596,11 @@ class App:
         self.shot_canvas = tk.Canvas(rf, width=480, height=270, bg='#202020', highlightthickness=0)
         self.shot_canvas.pack(pady=(0, 4))
         r = ttk.Frame(rf); r.pack(fill='x')
+        self.shot_btns = []
         for i, lab in enumerate(('車頭', '中間', '車尾')):
-            ttk.Button(r, text=lab, width=6, command=lambda i=i: self.show_shot(i)).pack(side='left', padx=(0, 4))
+            b = ttk.Button(r, text=lab, width=8, command=lambda i=i: self.show_shot(i))
+            b.pack(side='left', padx=(0, 4))
+            self.shot_btns.append(b)
         ttk.Button(r, text='播放短片', command=self.play_clip).pack(side='left', padx=(8, 0))
         ttk.Button(r, text='在影片中看這段', command=self.goto_event).pack(side='left', padx=(4, 0))
         self.var_shotlab = tk.StringVar(value='')
@@ -739,7 +804,7 @@ class App:
                  ('min_coverage', '最小軌道覆蓋率（0～1）', '低於此值視為非列車（汽車、行人）'),
                  ('min_both', '參考線兩側同時被擋的最小比例（0～1）', '低於此值視為非列車（車燈照射）'),
                  ('static_sec', '列車停止幾秒以上要備註（秒）', '只記錄「曾停止」，不會結束這一筆'),
-                 ('max_static', '完全不動多久才放棄等待（秒）', '預設 1800＝30 分鐘；防止畫面永久改變時整天變一筆'),
+                 ('max_static', '完全不動多久標需確認（秒）', '預設 1800＝30 分鐘；只標記，事件照樣等車開走才結束'),
                  ('long_event', '很長的佔用（秒）', '超過只標記需確認'),
                  ('clip_before', '短片：事件前秒數', ''),
                  ('clip_after', '短片：事件後秒數', '')]
@@ -1212,6 +1277,11 @@ class App:
         if broken:
             messagebox.showerror(APP, '這些影片無法開啟，請先移除：\n' + '\n'.join(broken[:15]))
             return
+        size_err = self.check_sizes()
+        if size_err:
+            messagebox.showerror(APP, size_err + '\n\n參考線、軌道範圍是用像素位置畫的，畫面大小不同時位置一定會錯，所以不能一起判讀。\n'
+                                 '請移除大小不同的影片，或分開判讀（大小不同的攝影機請另外設定一個監測站）。')
+            return
         issues = self.check_files()
         if issues and not self.confirm('影片檢查', '開始判讀前發現下列狀況：\n\n' + '\n'.join(issues[:15])
                                        + ('\n…（共 %d 項）' % len(issues) if len(issues) > 15 else '')
@@ -1242,22 +1312,25 @@ class App:
         self.worker = threading.Thread(target=self._work, args=(files, manual, prof_copy, out), daemon=True)
         self.worker.start()
 
-    def check_files(self):
-        """判讀前的檢查：畫面大小不一致、時間順序倒退／重疊／中間缺一段。回傳說明清單（空的＝沒問題）"""
-        out = []
+    def check_sizes(self):
+        """畫面大小：影片之間不一致、或和監測站設定（畫參考線時的畫面）不同 → 回傳錯誤說明（#50，不能「仍要判讀」）"""
         sizes = {}
         for f in self.files:
             i = f.get('info') or {}
             sizes.setdefault((i.get('w'), i.get('h')), []).append(os.path.basename(f['path']))
         if len(sizes) > 1:
-            out.append('● 影片的畫面大小不一致：' + '；'.join('%s×%s 有 %d 支' % (k[0], k[1], len(v)) for k, v in sizes.items())
-                       + '。參考線、軌道範圍是用像素位置畫的，大小不同的影片位置會錯。')
+            return ('影片的畫面大小不一致：' + '；'.join('%s×%s 有 %d 支（例：%s）' % (k[0], k[1], len(v), v[0])
+                                                    for k, v in sizes.items()))
         fs = self.profile.frame_size
-        if fs and len(sizes) >= 1:
-            diff = [k for k in sizes if list(k) != list(fs)]
-            if diff:
-                out.append('● 這個監測站的參考線是在 %d×%d 的畫面上畫的，但有 %d 支影片的大小不同（例：%s×%s），位置會錯。'
-                           % (fs[0], fs[1], sum(len(sizes[k]) for k in diff), diff[0][0], diff[0][1]))
+        if fs and sizes:
+            k = next(iter(sizes))
+            if list(k) != list(fs):
+                return '這個監測站的參考線是在 %d×%d 的畫面上畫的，但這些影片是 %s×%s。' % (fs[0], fs[1], k[0], k[1])
+        return ''
+
+    def check_files(self):
+        """判讀前的檢查：時間順序倒退／重疊／中間缺一段。回傳說明清單（空的＝沒問題）"""
+        out = []
         prev = None
         for f in self.files:
             st = self._start_of(f)
@@ -1310,12 +1383,26 @@ class App:
             if self.cancel_flag:
                 self.q.put(('stop', '已取消。', out))
                 return
+            # 正式讀完畫面時間後再檢查一次順序與重疊（加入影片時只快速讀開頭，#48）
+            files, timing, sorted_note, overlap = final_order(files, timing)
+            if overlap:
+                self.q.put(('stop', '正式讀取畫面時間後，發現下列影片的時間重疊（可能重複加入同一段錄影），請移除重複的再判讀：\n\n'
+                            + '\n'.join(overlap[:15]), out))
+                return
             bases = [t['offset'] for t in timing]
             prog = lambda fr, msg: self.q.put(('prog', 0.08 + fr * 0.8, '判讀中：' + msg))
-            evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag)
+            try:
+                evs = core.process(files, bases, prof, prog, lambda: self.cancel_flag)
+            except core.TimeOrderError as ex:                       # 判讀途中發現時間倒退／重疊（#69）
+                self.q.put(('stop', str(ex), out))
+                return
+            mark_time_jumps(evs, files, timing)
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
-            core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files)
+            core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files, bases=bases)
+            for t in timing:
+                if sorted_note:
+                    t.setdefault('note', sorted_note)
             export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing)
             export.write_excel(os.path.join(out, '列車通過紀錄.xlsx'), evs, prof, files, timing)
             export.write_csv(os.path.join(out, '列車通過紀錄.csv'), evs)
@@ -1360,10 +1447,15 @@ class App:
                             self.canvas.delete('busy')
                             self.var_postxt.set('讀不到這個位置的畫面')
                 elif kind == 'regen_done':
-                    _, e, err = m
+                    _, e, work_ev, err = m
                     e.pop('media_busy', None)
+                    if not err:
+                        e['shots'], e['clip'] = work_ev.get('shots') or [], work_ev.get('clip') or ''
+                        e['media_tag'] = work_ev.get('media_tag')
+                    why = e.pop('_regen_why', 'time')
                     self.var_tab2msg.set(('截圖與短片產生失敗：%s' % err) if err else
-                                         '已依修改後的時間（%s～%s）重新產生截圖與短片。' % (core.fmt_time(e['start']), core.fmt_time(e['end'])))
+                                         ('已依修改後的時間（%s～%s）重新產生截圖與短片。' % (core.fmt_time(e['start']), core.fmt_time(e['end']))
+                                          if why == 'time' else '已重新產生這一筆的截圖與短片。'))
                     _i, cur = self._sel_event()
                     if cur is e:
                         self.show_shot(0)
@@ -1379,6 +1471,7 @@ class App:
                     self.events, self.result_dir, self.run_files, self.run_timing, self.run_profile = evs, out, files, timing, prof
                     self.set_dirty(False)       # 判讀完已自動輸出 Excel
                     nv = sum(1 for e in evs if e['valid'])
+                    self.root.after(300, lambda evs=evs, c=cancelled, t=timing: self.show_summary(evs, c, t))
                     self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
                         '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
                     self.fill_events()
@@ -1446,6 +1539,11 @@ class App:
         else:
             messagebox.showwarning(APP, '無法儲存預設位置（程式資料夾和使用者資料夾都不能寫入），這次仍會使用您選的位置。')
 
+    def show_summary(self, evs, cancelled, timing):
+        need = any(e.get('need_check') for e in evs if e.get('valid'))
+        self.confirm('判讀完成', quality_summary(evs, cancelled, timing), ok='知道了', cancel=None,
+                     warn=need, icon=None if need else '✓')
+
     def _remove_empty(self, d):
         try:
             if os.path.isdir(d) and not os.listdir(d):
@@ -1490,7 +1588,11 @@ class App:
         self.var_cross.set(bool(e.get('crossing'))); self.var_checked.set(bool(e.get('checked')))
         self.var_note.set(e.get('note', ''))
         self.btn_valid.configure(text='改為「不是列車」' if e['valid'] else '改為「是列車」')
-        self.show_shot(0)
+        has_peak = any('2變化最大' in x for x in (e.get('shots') or []))
+        self.shot_btns[1].configure(text='變化最大' if has_peak else '中間')
+        self.shot_btns[0].configure(text='車頭' if e.get('start_known', True) else '第一畫面')   # 車頭／車尾未確認（#70）
+        self.shot_btns[2].configure(text='車尾' if e.get('end_known', True) else '最後畫面')
+        self.show_shot(1 if has_peak else 0)          # 已排除的先顯示「變化最大」，最看得出為什麼被排除
 
     def show_shot(self, k):
         i, e = self._sel_event()
@@ -1498,8 +1600,8 @@ class App:
         if e is None:
             return
         shots = e.get('shots') or []
-        want = ('1車頭', '2中間', '3車尾')[k]
-        name = next((s for s in shots if want in s), None)
+        want = (('1車頭', '1第一畫面'), ('2中間', '2變化最大'), ('3車尾', '3最後畫面'))[k]   # 已排除的第二張是「變化最大」（#60）
+        name = next((s for s in shots if any(w in s for w in want)), None)
         if not name:
             self.var_shotlab.set('（沒有截圖）')
             return
@@ -1522,7 +1624,8 @@ class App:
             self.var_tab2msg.set('短片還在依修改後的時間產生中，做好會自動播放…')
             return
         if not e.get('clip'):
-            messagebox.showinfo(APP, '這一筆沒有短片（可在「進階」開啟產生短片）。')
+            messagebox.showinfo(APP, '這一筆沒有短片。已排除的事件不產生短片，請看截圖或按「在影片中看這段」。'
+                                if not e.get('valid') else '這一筆沒有短片（可在「進階」開啟產生短片）。')
             return
         open_path(os.path.join(self.result_dir, '短片', e['clip']))
 
@@ -1556,6 +1659,8 @@ class App:
         if e is None:
             messagebox.showinfo(APP, '請先在清單選一筆。')
             return
+        if self._media_busy():
+            return
         try:
             ns = self._parse_event_time(self.var_es.get(), e['start'])
             ne = self._parse_event_time(self.var_ee.get(), e['end'])
@@ -1569,7 +1674,9 @@ class App:
         if time_changed:
             loc_s, loc_e = self._locate(ns), self._locate(ne)
             if loc_s is None or loc_e is None:
-                messagebox.showerror(APP, '修改後的時間不在這次判讀的影片範圍內，請確認時間是否正確。')
+                bad = core.fmt_time(ns if loc_s is None else ne)
+                messagebox.showerror(APP, '%s 沒有對應的錄影畫面（不在這次判讀的影片範圍內，或落在兩支影片中間沒有錄影的缺口）。\n'
+                                     '請確認時間是否正確。' % bad)
                 return
             e['start_file'], e['start_pos'] = loc_s
             e['end_file'], e['end_pos'] = loc_e
@@ -1595,31 +1702,48 @@ class App:
             if f not in self._dur_cache:
                 self._dur_cache[f] = ((core.video_info(f) or {}).get('dur') or 0.0)
             pos = ts - off
-            if -0.5 <= pos <= self._dur_cache[f] + 0.5:
-                best = (f, max(0.0, pos))
+            if -0.05 <= pos <= self._dur_cache[f] + 0.05:     # 只接受真的有錄影的時間，不吸附到旁邊的影片（#58）
+                best = (f, min(max(0.0, pos), self._dur_cache[f]))
                 break
         return best
 
-    def regen_media(self, e):
-        """時間改過的那一筆：依新的時間重做截圖（車頭／中間／車尾）與短片（前後各幾秒），在背景做"""
+    def regen_media(self, e, why='time'):
+        """依這一筆目前的時間重做截圖與短片（時間改過、或改成「是列車」時），在背景做。
+        背景只處理副本，做完由畫面執行緒一次套用；做的時候不能再套用修改或儲存（#55）"""
         e['media_busy'] = True
+        e['_regen_why'] = why
         prof = self.run_profile or self.profile
         files = list(self.run_files)
+        bases = [t.get('offset') for t in self.run_timing] if self.run_timing else None
         out = self.result_dir
-        self.var_tab2msg.set('依修改後的時間重新產生截圖與短片中…')
+        work_ev = {k: v for k, v in e.items() if k not in ('shots', 'clip')}
+        if not work_ev.get('media_tag'):       # v1.0.8 以前的結果：沿用原本的檔名前綴（例：002、X001）
+            old = (e.get('shots') or [''])[0].split('_')[0] or (e.get('clip') or '').split('.')[0]
+            if old:
+                work_ev['media_tag'] = old
+        self.var_tab2msg.set('依修改後的時間重新產生截圖與短片中…（完成前不能再套用修改或儲存）' if why == 'time'
+                             else '產生這一筆的短片中…（完成前不能再套用修改或儲存）')
 
         def work():
             try:
-                core.save_frames_and_clips([e], prof, out, files=files)
+                core.save_frames_and_clips([work_ev], prof, out, files=files, bases=bases)
                 err = ''
             except Exception as ex:
                 err = str(ex)
-            self.q.put(('regen_done', e, err))
+            self.q.put(('regen_done', e, work_ev, err))
         threading.Thread(target=work, daemon=True).start()
+
+    def _media_busy(self):
+        if any(ev.get('media_busy') for ev in self.events or []):
+            messagebox.showinfo(APP, '截圖與短片還在更新，請等上方顯示「已重新產生」後再操作。')
+            return True
+        return False
 
     def toggle_valid(self):
         i, e = self._sel_event()
         if e is None:
+            return
+        if self._media_busy():
             return
         e['valid'] = not e['valid']
         tag = '人工改為列車' if e['valid'] else '人工改為非列車'
@@ -1627,6 +1751,8 @@ class App:
         if tag not in note:
             e['note'] = (note + '；' + tag).strip('；')
         self._refresh_keep(e)
+        if e['valid'] and not e.get('clip') and (self.run_profile or self.profile).make_clips and self.result_dir:
+            self.regen_media(e, why='valid')        # 已排除的沒有短片（#60），改成列車時補做
         if not e['valid'] and not self.show_excluded.get():
             # 不自動打開「顯示已排除」（使用者要求）；那一筆從清單消失，改選它原本位置的下一筆
             kids = self.tv.get_children()
@@ -1655,6 +1781,8 @@ class App:
         if not self.result_dir:
             messagebox.showinfo(APP, '還沒有結果。')
             return
+        if self._media_busy():
+            return
         prof = self.run_profile or self.profile
         try:
             export.save_json(os.path.join(self.result_dir, 'results.json'), self.events, prof, self.run_files, self.run_timing)
@@ -1679,8 +1807,12 @@ class App:
             messagebox.showinfo(APP, '沒有判定為列車的事件，不需要輸出。')
             return
         unchecked = sum(1 for e in valid if e.get('need_check') and not e.get('checked'))
-        if unchecked and not self.confirm('確認', '還有 %d 筆「需人工確認」還沒勾「已人工確認」。\n\n'
-                                          '這些也會照目前的時間輸出。確定要輸出嗎？' % unchecked, ok='照樣輸出', warn=True):
+        no_end = sum(1 for e in valid if e.get('end_known') is False and not e.get('checked'))
+        if unchecked and not self.confirm('確認', '還有 %d 筆「需人工確認」還沒勾「已人工確認」。%s\n\n'
+                                          '這些也會照目前的時間輸出。確定要輸出嗎？'
+                                          % (unchecked, ('\n\n其中%d筆「車尾未確認」：離開時間只是程式最後看到列車的時間，\n'
+                                                         '不是真的車尾離開（影片結束、取消、錄影中斷或長時間沒有動靜）。' % no_end) if no_end else ''),
+                                          ok='照樣輸出', warn=True):
             return
         path = filedialog.asksaveasfilename(title='儲存噪音分析用的記事本檔', initialdir=self.result_dir,
                                             initialfile='列車進入及離開時間.txt', defaultextension='.txt',
@@ -1731,15 +1863,16 @@ class App:
         self.set_dirty(False)
         self.fill_events()
 
-    def confirm(self, title, msg, ok='確定', cancel='取消', warn=False):
-        """自訂確認視窗（按鈕文字固定是中文，不受作業系統語言影響）。確定→True，取消／關掉視窗→False"""
+    def confirm(self, title, msg, ok='確定', cancel='取消', warn=False, icon=None):
+        """自訂確認視窗（按鈕文字固定是中文，不受作業系統語言影響）。確定→True，取消／關掉視窗→False。
+        cancel=None：只有一個按鈕（通知用）"""
         w = tk.Toplevel(self.root)
         w.title(title)
         w.transient(self.root)
         w.resizable(False, False)
         res = {'v': False}
         body = ttk.Frame(w, padding=(18, 16, 18, 8)); body.pack(fill='both')
-        tk.Label(body, text='⚠' if warn else '？', fg='#c05000' if warn else '#1060c0',
+        tk.Label(body, text=icon or ('⚠' if warn else '？'), fg='#c05000' if warn else '#1060c0',
                  font=(self.font_family, 22, 'bold')).pack(side='left', anchor='n', padx=(0, 12))
         ttk.Label(body, text=msg, justify='left', wraplength=440).pack(side='left', fill='x')
         bar = ttk.Frame(w, padding=(18, 4, 18, 14)); bar.pack(fill='x')
@@ -1747,10 +1880,14 @@ class App:
         def done(v):
             res['v'] = v
             w.destroy()
-        b_cancel = ttk.Button(bar, text=cancel, width=max(10, len(cancel) * 2 + 2), command=lambda: done(False))
-        b_cancel.pack(side='right')
+        b_ok = None
+        if cancel:
+            b_cancel = ttk.Button(bar, text=cancel, width=max(10, len(cancel) * 2 + 2), command=lambda: done(False))
+            b_cancel.pack(side='right')
         b_ok = ttk.Button(bar, text=ok, width=max(10, len(ok) * 2 + 2), command=lambda: done(True))
-        b_ok.pack(side='right', padx=(0, 8))
+        b_ok.pack(side='right', padx=(0, 8) if cancel else 0)
+        if not cancel:
+            b_cancel = b_ok
         w.protocol('WM_DELETE_WINDOW', lambda: done(False))
         w.bind('<Escape>', lambda e: done(False))
         w.update_idletasks()

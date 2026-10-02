@@ -52,7 +52,7 @@ class Profile:
     static_sec: float = 3.0               # 佔用中靜止超過幾秒 → 備註「列車曾停止」（只記錄，不結束事件）
     day_saturation: float = 25.0          # 畫面彩度高於此值＝白天（夜間紅外線模式是黑白，彩度接近 0）
     light_ncc: float = 0.45               # 白天：參考線附近和背景的紋理相似度高於此值 → 只是光線變亮／變暗（陽光、雲影），不是列車
-    max_static: float = 1800.0            # 佔用中「完全靜止」超過幾秒才放棄等待：在最後有動靜的時間結束並標需確認
+    max_static: float = 1800.0            # 佔用中「完全靜止」超過幾秒標需人工確認（v1.0.10 起只標記、不結束事件，#67）
                                           # （防止攝影機被撞歪、畫面永久改變時，整天變成一筆）
     clip_before: float = 3.0              # 短片：事件前幾秒
     clip_after: float = 3.0               # 短片：事件後幾秒
@@ -108,13 +108,14 @@ class Detector:
         cv2.line(m, (int(xa - self.cx0), int(ya - self.cy0)), (int(xb - self.cx0), int(yb - self.cy0)), 255,
                  max(1, int(profile.ref_width)))
         self.ref_mask = m > 0
-        # 紋理比對用：參考線左右各加寬 10 像素的帶狀區域
-        self.band = cv2.dilate(m, np.ones((1, 21), np.uint8)) > 0
         self.light_since = None   # 白天「只是光線變化」從什麼時候開始
         x0, y0, x1, y1 = profile.track_rect
         self.tr = (int(min(x0, x1) - self.cx0), int(min(y0, y1) - self.cy0),
                    int(max(x0, x1) - self.cx0), int(max(y0, y1) - self.cy0))
         self.horiz = profile.horizontal()
+        # 紋理比對用：參考線「沿軌道方向」前後各加寬 10 像素的帶狀區域
+        # （左右走向往左右加寬；上下走向往上下加寬。v1.0.8 以前一律往左右，上下走向時只把線拉長，修正清單 #51）
+        self.band = cv2.dilate(m, np.ones((1, 21) if self.horiz else (21, 1), np.uint8)) > 0
         rp = profile.ref_pos() - (min(x0, x1) if self.horiz else min(y0, y1))
         self.ref_idx = int(round(rp))
         self.bg = None
@@ -123,7 +124,10 @@ class Detector:
         self.pending_close = None
         self.events: List[dict] = []
         self.prev = None
-        self.first_t = None     # 第一個檔案第一格的時間
+        self.first_t = None     # 第一個檔案第一格的時間（錄影中斷後重新計算）
+        self.start_kind = 'video'   # 一開始就有變化時的原因：video＝第一支影片開頭、gap＝錄影中斷後
+        self.bg_note = ''       # 初始背景的說明（背景不確定時，這支影片的列車都標需確認）
+        self.bg_note_file = None
         self.small = self.bg_small = self.out_mask = None   # 整個畫面縮小版（估計攝影機自動調亮度）
 
     def feed(self, t_abs: float, gray: np.ndarray, sat: float, file: str, pos: float, frame_bgr=None):
@@ -135,6 +139,21 @@ class Detector:
         gain = self._exposure(frame_bgr)
         if gain != 1.0:
             g = g / gain        # 攝影機自動調亮度（例如亮的列車經過後整個畫面變暗）→ 先還原再比較
+        if self._camera_check(t_abs, g, gain, file, pos):
+            return
+        if getattr(self, 'warm_until', None) is not None:
+            if len(self.warm_frames) < 80 and int(t_abs * 4) != int(getattr(self, '_warm_last', -1) * 4):
+                self.warm_frames.append(g * gain)
+                self._warm_last = t_abs
+            self.prev = g
+            if t_abs >= self.warm_until:
+                if len(self.warm_frames) >= 3:
+                    self.bg = np.median(np.stack(self.warm_frames), axis=0).astype(np.float32)
+                if self.small is not None:
+                    self.bg_small = self.small.copy()
+                self.warm_until, self.warm_frames = None, []
+                self.first_t = t_abs
+            return
         diff = np.abs(g - self.bg)
         if self.prev is not None and self.prev.shape == g.shape:
             fd = np.abs(g - self.prev)
@@ -176,10 +195,13 @@ class Detector:
             self.light_since = None
         if self.cur is None:
             if on:
-                self.cur = dict(at_file_start=(self.first_t is not None and t_abs - self.first_t < 2.0),start=t_abs, start_file=file, start_pos=pos, end=t_abs, end_file=file, end_pos=pos,
-                                peak=score, coverage=cov, sat=[sat], rec=list(self.hist), rec_tail=[],
-                                last_motion=t_abs, scores=[(t_abs, score, file, pos)], tail=[(t_abs, score, file, pos)],
-                                static_now=0.0, static_max=0.0, static_end=False)
+                at_start = self.first_t is not None and t_abs - self.first_t < 2.0
+                self.cur = dict(at_file_start=self.start_kind if at_start else '', start=t_abs, start_file=file, start_pos=pos,
+                                end=t_abs, end_file=file, end_pos=pos,
+                                peak=score, peak_t=t_abs, peak_file=file, peak_pos=pos, coverage=cov, sat=[sat], rec=list(self.hist), rec_tail=[],
+                                last_motion=t_abs, last_motion_file=file, last_motion_pos=pos,
+                                scores=[(t_abs, score, file, pos)], tail=[(t_abs, score, file, pos)],
+                                static_now=0.0, static_max=0.0, static_alarm=False, incomplete='')
         else:
             c = self.cur
             if t_abs - c['start'] <= self.HEAD_SEC:
@@ -189,7 +211,7 @@ class Detector:
                 while c['rec_tail'] and t_abs - c['rec_tail'][0][0] > self.TAIL_SEC:
                     c['rec_tail'].pop(0)
             if moving:
-                c['last_motion'] = t_abs
+                c['last_motion'], c['last_motion_file'], c['last_motion_pos'] = t_abs, file, pos
             c['static_now'] = t_abs - c['last_motion']
             if occupied:
                 c['static_max'] = max(c['static_max'], c['static_now'])
@@ -199,21 +221,14 @@ class Detector:
             while t_abs - c['tail'][0][0] > 15:
                 c['tail'].pop(0)
             if occupied and t_abs - c['last_motion'] > self.p.max_static:
-                # 列車停住不算離開。只有「完全不動」超過 max_static（預設 30 分鐘）才放棄等待，
-                # 避免攝影機被撞歪、畫面永久改變時整天變成一筆；在最後有動靜的時間結束並標記需人工確認
-                if c['last_motion'] < c['end']:
-                    c['end'] = c['last_motion']
-                    c['end_file'], c['end_pos'] = file, pos - (t_abs - c['last_motion'])
-                c['static_end'] = True
-                self._close()
-                self.bg = g * gain
-                if self.small is not None:
-                    self.bg_small = self.small.copy()
-                return
+                # 列車停多久都不結束（使用者 2026-10-02 決定，#67）：超過 max_static 只標需人工確認，事件繼續，
+                # 等車真的開走、確認離開才結束。攝影機被碰歪另外由 _camera_check 處理
+                c['static_alarm'] = True
             if occupied:
                 self.pending_close = None
                 c['end'], c['end_file'], c['end_pos'] = t_abs, file, pos
-                c['peak'] = max(c['peak'], score)
+                if score > c['peak']:
+                    c['peak'], c['peak_t'], c['peak_file'], c['peak_pos'] = score, t_abs, file, pos
                 c['coverage'] = max(c['coverage'], cov)
                 c['both'] = max(c.get('both', 0.0), both)
                 c['sat'].append(sat)
@@ -246,10 +261,44 @@ class Detector:
                 self.bg_small = self.bg_small * (1 - a) + self.small * a
 
     EXPO_SCALE = 8
+    CAM_NCC = 0.35        # 軌道以外的畫面和背景的紋理相關低於這個值＝攝影機畫面整個改變（樣本最低：白天 0.83、夜間車燈 0.56）
+    CAM_SEC = 5.0         # 持續幾秒才算（車燈、閃光只有一下子）
+    CAM_WARM = 10.0       # 攝影機畫面改變後，花幾秒重新建立背景（這段時間不判讀）
+
+    def _camera_check(self, t_abs, g, gain, file, pos):
+        """攝影機被碰歪、轉動：整個畫面（含軌道以外的樹、山、天空）都和背景不一樣，紋理相關很低。
+        列車只會改變軌道那一帶，車燈照亮只是亮度變、而且很短。持續 CAM_SEC 秒就：
+        進行中的那一筆在畫面改變的那一刻結束（車尾未確認；如果是畫面改變才「開始」的，就不是列車），背景重建（#67）。
+        回傳 True＝這一格已處理完（重建背景），不再做後面的判斷"""
+        ncc = getattr(self, '_out_ncc', None)
+        if ncc is None or ncc >= self.CAM_NCC:
+            self.cam_since = None
+            return False
+        if getattr(self, 'cam_since', None) is None:
+            self.cam_since = (t_abs, file, pos)
+            return False
+        t0, f0, p0 = self.cam_since
+        if t_abs - t0 < self.CAM_SEC:
+            return False
+        if self.cur is not None:
+            c = self.cur
+            if c['end'] > t0:
+                c['end'], c['end_file'], c['end_pos'] = t0, f0, p0
+            c['camera_start'] = c['start'] >= t0 - 0.3          # 畫面改變那一刻才開始的：不是列車
+            c['camera_t'] = t0
+            self.pending_close = None
+            self.finish('camera')
+        self.restart(g * gain, '', kind='camera')
+        # 重新建立背景：接下來 CAM_WARM 秒的畫面取中位數（目前這一格可能還有列車的一部分，直接當背景會卡住）
+        self.warm_until, self.warm_frames = t_abs + self.CAM_WARM, []
+        self.cam_since = None
+        self.camera_events = getattr(self, 'camera_events', []) + [t0]
+        return True
 
     def _exposure(self, frame_bgr):
         """整個畫面（扣掉軌道範圍附近與上方字幕）目前亮度 ÷ 背景亮度的中位數"""
         self.small = None
+        self._out_ncc = None
         if frame_bgr is None:
             return 1.0
         k = self.EXPO_SCALE
@@ -271,14 +320,35 @@ class Detector:
             self.out_mask = m
         sel = self.out_mask & (self.bg_small > 15) & (self.bg_small < 245)
         if sel.sum() < 50:
+            self._out_ncc = None
             return 1.0
+        self._out_ncc = _ncc(sm[sel], self.bg_small[sel])
         r = float(np.median(sm[sel] / self.bg_small[sel]))
         return r if 0.5 < r < 2.0 and abs(r - 1) > 0.01 else 1.0
 
-    def finish(self):
+    def finish(self, why='video_end', note=''):
+        """影片全部處理完（video_end）、使用者取消（cancel）或錄影中斷（gap）時收尾。
+        這時參考線上還有車（不是已經離開、正在等確認），車尾時間就不是真的車尾離開，標「車尾未確認」（#45、#49）"""
         if self.cur is not None:
+            # 正在等確認（車尾看起來離開了，但還沒等滿 max(merge_gap, SIDE_WINDOW) 秒，可能只是車廂空隙）
+            # 也不算已確認（#66）
+            self.cur['incomplete'] = why
+            self.cur['incomplete_note'] = note
+            self.cur['confirming'] = self.pending_close is not None
             self._close()
         return self.events
+
+    def restart(self, bg, note='', kind='gap'):
+        """錄影中斷（gap）或攝影機畫面改變（camera）後重新開始：背景、上一格、最近的歷史都不延續（#49、#67）"""
+        self.bg = bg
+        self.bg_small = None
+        self.prev = None
+        self.hist = []
+        self.light_since = None
+        self.pending_close = None
+        self.first_t = None
+        self.start_kind = kind
+        self.bg_note = note
 
     def _onset(self, c):
         """回傳 (車頭時間差, 車尾時間差)：參考線後側（右／下）中位數減前側（左／上）中位數，>0 表示往右／往下"""
@@ -336,6 +406,8 @@ class Detector:
                     s_shift = t - c['start']
                     c['start'], c['start_file'], c['start_pos'] = t, f, pos
                 break
+        if c.get('incomplete'):
+            return s_shift, e_shift          # 車尾未確認（影片結束、取消、錄影中斷）：保留最後看到列車的時間
         for t, v, f, pos in reversed([x for x in c['tail'] if x[0] <= c['end']]):
             if v >= lvl:
                 if c['end'] - t > 0.3 and t > c['start']:
@@ -371,8 +443,11 @@ class Detector:
         ev = dict(first_change=first_change, start=c['start'], end=c['end'], start_file=c['start_file'], end_file=c['end_file'],
                   start_pos=c['start_pos'], end_pos=c['end_pos'], coverage=round(c['coverage'], 3), both=round(c.get('both', 0.0), 3), peak=round(c['peak'], 1),
                   direction=direction, dir_on=round(d_on, 2), dir_off=round(d_off, 2), dir_confident=bool(agree),
-                  night=night, valid=True, reason='', need_check=False)
+                  night=night, valid=True, reason='', need_check=False, end_known=True,
+                  peak_t=c.get('peak_t'), peak_file=c.get('peak_file'), peak_pos=c.get('peak_pos'),
+                  start_shift=round(shift, 2), end_shift=round(eshift, 2), check_items=[])
         reasons = []
+        items = ev['check_items']             # 品質摘要用的分類（和備註同時寫，用詞一致）
         if dur < self.p.min_duration:
             ev['valid'] = False
             reasons.append('時間太短（%.1f 秒，可能是閃爍或畫面亮度跳動）' % dur)
@@ -382,29 +457,88 @@ class Detector:
         elif c.get('both', 0.0) < self.p.min_both:
             ev['valid'] = False
             reasons.append('只有參考線一側有變化，沒有東西橫跨參考線（可能是車燈照射或路上的車）')
+        if c.get('incomplete'):
+            ev['end_known'] = False
+        ev['start_known'] = not c.get('at_file_start')
+        if c.get('camera_start'):
+            ev['valid'] = False
+            reasons.insert(0, '攝影機畫面在 %s 整個改變（可能被碰到或轉動），不是列車；程式用之後 %d 秒的畫面重新建立背景（這段時間沒有判讀）'
+                           % (fmt_time(c['camera_t']), self.CAM_WARM))
         if ev['valid']:
             if not agree:
                 ev['need_check'] = True
-                reasons.append('方向不確定')
-            if c.get('static_end'):
+                reasons.append('方向不確定'); items.append('方向不確定')
+            wait = max(self.p.merge_gap, self.SIDE_WINDOW)
+            if c.get('confirming') and c.get('incomplete') in ('video_end', 'cancel', 'gap'):
                 ev['need_check'] = True
-                reasons.append('參考線上超過 %d 分鐘完全沒有動靜，程式在最後有動靜的時間結束（可能停車很久或畫面永久改變，請確認車尾時間）'
-                               % round(self.p.max_static / 60))
+                when = {'video_end': '影片就結束了', 'cancel': '就按了取消',
+                        'gap': '錄影就中斷了%s' % c.get('incomplete_note', '')}[c['incomplete']]
+                reasons.append('車尾未確認：車尾看起來在 %s 離開，但還沒等滿確認時間（%g 秒，用來排除車廂之間的空隙）%s'
+                               % (fmt_time(c['end']), wait, when))
+                items.append('車尾離開後確認時間不足（車尾未確認）')
+            elif c.get('incomplete') == 'camera':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：攝影機畫面在 %s 整個改變（可能被碰到或轉動），程式在這裡結束這一筆，'
+                               '並用之後 %d 秒的畫面重新建立背景（這段時間沒有判讀）' % (fmt_time(c['camera_t']), self.CAM_WARM))
+                items.append('攝影機畫面改變（車尾未確認）')
+            elif c.get('incomplete') == 'video_end':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：影片結束時列車仍在參考線上（車尾時間是影片最後一格 %s）' % fmt_time(c['end']))
+                items.append('影片結束時列車仍在參考線上（車尾未確認）')
+            elif c.get('incomplete') == 'cancel':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：判讀被取消時列車仍在參考線上（車尾時間是取消前最後一格 %s）' % fmt_time(c['end']))
+                items.append('取消時列車仍在參考線上（車尾未確認）')
+            elif c.get('incomplete') == 'gap':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：錄影在 %s 中斷%s，當時列車仍在參考線上' % (fmt_time(c['end']), c.get('incomplete_note', '')))
+                items.append('錄影中斷時列車仍在參考線上（車尾未確認）')
+            if c.get('static_alarm'):
+                ev['need_check'] = True
+                reasons.append('參考線上曾經超過 %s 完全沒有動靜（可能列車長時間停駛，或攝影機／畫面異常），已計入通過時間，請確認'
+                               % fmt_span(self.p.max_static))
+                items.append('長時間完全沒有動靜')
             elif c.get('static_max', 0) >= self.p.static_sec:
                 reasons.append('列車曾在參考線上停止約 %d 秒（已計入通過時間）' % round(c['static_max']))
             if dur > self.p.long_event:
                 ev['need_check'] = True
-                reasons.append('佔用時間很長（可能停車或畫面變化）')
+                reasons.append('佔用時間很長（%d 分鐘，可能停車或畫面變化）' % round(dur / 60)); items.append('佔用時間很長')
             if shift > 0:
-                reasons.append('參考線在 %s 就開始有微小變化（可能是車燈先照到），車頭時間取變化明顯的時刻' % fmt_time(first_change))
-            if c.get('at_file_start'):
+                reasons.append('參考線在 %s 就開始有微小變化（可能是車燈先照到），車頭時間取變化明顯的時刻（往後 %.1f 秒）'
+                               % (fmt_time(first_change), shift))
+            if max(shift, eshift) > REFINE_CHECK:
+                ev['need_check'] = True
+                items.append('車頭／車尾自動修正超過 %d 秒' % REFINE_CHECK)
+            if eshift > 0:
+                reasons.append('參考線到 %s 還有微小變化（可能是車尾後光線或背景改變），車尾時間取變化明顯的時刻（往前 %.1f 秒）'
+                               % (fmt_time(last_change), eshift))
+            if c.get('at_file_start') == 'camera':
+                ev['need_check'] = True
+                reasons.append('攝影機畫面改變、重新建立背景後一開始就有變化（車頭時間不確定）')
+                items.append('攝影機畫面改變後一開始就有列車（車頭未確認）')
+            elif c.get('at_file_start') == 'gap':
+                ev['need_check'] = True
+                reasons.append('錄影中斷後，下一支影片一開始就有變化（列車可能在錄影恢復前就已到達，車頭時間是影片開頭）')
+                items.append('錄影中斷後一開始就有列車（車頭未確認）')
+            elif c.get('at_file_start'):
                 ev['need_check'] = True
                 reasons.append('影片一開始就有變化（列車可能在影片開始前就已到達，車頭時間是影片開頭）')
+                items.append('影片一開始就有列車（車頭未確認）')
+
+            if self.bg_note and self.bg_note_file in (c['start_file'], c['end_file']):
+                ev['need_check'] = True
+                reasons.append(self.bg_note); items.append('影片開頭的背景不確定')
             if night:
                 reasons.append('夜間')
         ev['reason'] = '；'.join(reasons)
         ev['last_change'] = last_change
         self.events.append(ev)
+
+
+def _ncc(u, v):
+    """兩組像素的正規化相關（紋理相似度，-1～1；和整體亮度、對比的倍率無關）"""
+    u = u - u.mean(); v = v - v.mean()
+    return float((u * v).sum() / np.sqrt((u * u).sum() * (v * v).sum() + 1e-6))
 
 
 def work_crop(profile: Profile, w: int, h: int, pad: int = 8):
@@ -436,6 +570,7 @@ def process(files: List[str], bases: List[float], profile: Profile,
         durs.append((info or {}).get('dur') or 600)
     total = sum(durs) or 1
     done = 0.0
+    prev_end = None                       # 上一支影片最後一格的畫面時間（實際讀到的，不用檔頭的長度）
     for fi, (f, base) in enumerate(zip(files, bases)):
         cap = cv2.VideoCapture(f)
         if not cap.isOpened():
@@ -444,7 +579,21 @@ def process(files: List[str], bases: List[float], profile: Profile,
         crop = work_crop(profile, W, H)
         if det is None:
             det = Detector(profile, crop)
-            det.bg = initial_background(f, crop)   # 開頭若剛好有列車，不會被當成背景
+            det.bg, det.bg_note = initial_background(f, crop, profile)   # 開頭若剛好有列車經過，不會被當成背景
+            det.bg_note_file = f
+        elif prev_end is not None and base < prev_end - OVERLAP_SEC:
+            # 實際讀完上一支後，下一支的時間比它還早：時間倒退或重疊，不可以把時間往回餵給判讀（#69）
+            raise TimeOrderError('依實際影片時間確認，「%s」的開始時間 %s 比上一支「%s」實際的結尾 %s 還早 %.1f 秒'
+                                 '（時間重疊或倒退）。請檢查影片是否重複加入、順序或畫面時間是否正確。'
+                                 % (os.path.basename(f), fmt_time(base), os.path.basename(files[fi - 1]),
+                                    fmt_time(prev_end), prev_end - base))
+        elif prev_end is not None and base - prev_end > GAP_SEC:
+            # 錄影中斷（缺檔）：前後不是連續畫面。進行中的那一筆在中斷處結束（車尾未確認），背景重新建立（#49）
+            gap = base - prev_end
+            det.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
+            bg, note = initial_background(f, crop, profile)
+            det.restart(bg, note)
+            det.bg_note_file = f
         k = 0
         last_pos = 0.0
         sat = 50.0
@@ -467,26 +616,71 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
             if cancel and k % 30 == 0 and cancel():
                 cap.release()
-                return det.finish()
+                return det.finish('cancel')
+        prev_end = base + last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15) if k else base
         cap.release()
         done += durs[fi]
-    return det.finish() if det else []
+    return det.finish('video_end') if det else []
 
 
-def initial_background(path, crop, n=31, seconds=90.0):
-    """第一支影片開頭 seconds 秒內平均取 n 格，取中位數當初始背景（影片開頭有列車經過也不會被學進去）。
-    不取整支影片：傍晚、清晨光線變化大，整支的中位數和開頭的畫面差很多，會造成一開始就誤判有車（v1.0.4 開發時實測）。
+GAP_SEC = 5.0       # 前一支影片結束到下一支開始超過幾秒，就當成錄影中斷（和開始判讀前的「缺檔」檢查一致）
+OVERLAP_SEC = 2.0   # 下一支影片比上一支實際結尾早超過幾秒，就是時間重疊／倒退（和開始判讀前的「重疊」檢查一致）
+
+
+class TimeOrderError(RuntimeError):
+    """判讀途中發現影片時間倒退或重疊（#69）"""
+
+
+def fmt_span(sec):
+    sec = int(round(sec))
+    if sec >= 3600:
+        return '%d 小時 %d 分' % (sec // 3600, sec % 3600 // 60)
+    if sec >= 60:
+        return '%d 分 %d 秒' % (sec // 60, sec % 60)
+    return '%d 秒' % sec
+
+
+def initial_background(path, crop, profile: Profile = None, n=31, seconds=90.0):
+    """初始背景。回傳 (背景, 說明)。
+    ① 開頭 seconds 秒內平均取 n 格的中位數（影片開頭有列車「經過」也不會被學進去）。
+       不直接用整支影片：傍晚、清晨光線變化大，整支的中位數和開頭的畫面差很多，會造成一開始就誤判有車（修正清單 #32）。
+    ② 列車在開頭「停著」超過一半時間時，①會把列車學成背景（修正清單 #56）。另外取整支影片的中位數，
+       亮度調成和①一樣後比較參考線上的差異：差異超過「佔用開始門檻」＝有東西在參考線上停很久，但分不出是
+       「開頭停著、後來開走」還是「後來開進來、一直停到影片結束」（兩種情形畫面是對稱的）。
+       所以照樣用①，回傳說明，這支影片的列車都標需人工確認（寧可請人確認，也不要默默給錯的時間）。
     先試跳轉（快）；跳轉不可靠的影片（實際每秒格數和檔頭不同）改成從頭依序讀。"""
     info = video_info(path) or {}
-    dur = min(seconds, info.get('dur') or seconds)
+    total = info.get('dur') or seconds
+    head = _median_frames(path, crop, [min(seconds, total) * (k + 0.5) / n for k in range(n)])
+    if head is None or profile is None or total < seconds * 1.5:
+        return head, ''
+    whole = _median_frames(path, crop, [total * (k + 0.5) / 41 for k in range(41)])
+    if whole is None:
+        return head, ''
+    det = Detector(profile, crop)
+    ref = det.ref_mask
+    r = float(np.median(head / np.maximum(whole, 1.0)))
+    r = r if 0.5 < r < 2.0 else 1.0
+    adj = whole * r
+    if float(np.abs(head - adj)[ref].mean()) > profile.on_level:
+        return head, BG_UNSURE
+    return head, ''
+
+
+REFINE_CHECK = 5.0   # 車頭／車尾自動修正（_refine）超過幾秒就標需確認。使用者可接受的誤差是 5 秒（#57；實際樣本最大 4.1 秒）
+BG_UNSURE = '這支影片開頭的畫面和整支影片不一樣（可能有列車在影片開頭停著、或停了很久），背景不確定，列車時間可能不準'
+
+
+
+def _median_frames(path, crop, targets):
+    """在 targets（影片內秒數）各取一格，回傳中位數（灰階、模糊、只取工作範圍）"""
     x0, y0, x1, y1 = crop
-    prep = lambda fr: cv2.GaussianBlur(cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), (5, 5), 0)
-    targets = [dur * (k + 0.5) / n for k in range(n)]
+    prep = lambda fr: cv2.GaussianBlur(cv2.cvtColor(fr[y0:y1, x0:x1], cv2.COLOR_BGR2GRAY), (5, 5), 0).astype(np.float32)
     frames = []
     cap = cv2.VideoCapture(path)
     try:
-        ok_seek = True
-        for t in targets:
+        ok_seek = path not in _BAD_SEEK
+        for t in (targets if ok_seek else []):
             cap.set(cv2.CAP_PROP_POS_MSEC, t * 1000)
             ok, fr = cap.read()
             p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
@@ -517,9 +711,42 @@ def initial_background(path, crop, n=31, seconds=90.0):
 # （實測跳 100 秒落在 246 秒），跳到後段甚至讀不到畫面。所以截圖與短片一律「每支影片從頭依序讀一次」，
 # 用每一格實際的時間決定要不要存，不使用跳轉。
 
-def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None, cancel=None, files=None):
-    """每筆事件存車頭／中間／車尾截圖，並（可選）擷取前後幾秒的短片。
-    files：影片處理順序（跨兩支影片的短片要依序接起來）；沒給就依事件出現的順序。"""
+LONG_CLIP = 60.0      # 超過幾秒的事件，短片只做車頭前後、車尾前後兩段（使用者 2026-10-02 決定，#59）
+CLIP_PART = 10.0      # 兩段各取車頭之後／車尾之前幾秒
+
+
+def _timeline(files, bases, events):
+    """每支影片的 (畫面時間起點, 長度)。有 bases 就用（判讀時的時間對照）；沒有就從事件反推（舊的呼叫方式）"""
+    tl = {}
+    if bases:
+        for f, b in zip(files, bases):
+            if b is not None:
+                tl[f] = (b, (video_info(f) or {}).get('dur') or 0.0)
+        return tl
+    for ev in events:
+        for f, t, p in ((ev['start_file'], ev['start'], ev['start_pos']), (ev['end_file'], ev['end'], ev['end_pos'])):
+            if f not in tl:
+                tl[f] = (t - p, (video_info(f) or {}).get('dur') or 0.0)
+    return tl
+
+
+def _at(tl, order, t):
+    """畫面時間 → (影片, 影片內秒數)；落在缺口或範圍外回傳 None"""
+    for f in order:
+        if f in tl:
+            b, d = tl[f]
+            if b - 1e-3 <= t <= b + d + 1e-3:
+                return f, max(0.0, t - b)
+    return None
+
+
+def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None, cancel=None, files=None, bases=None):
+    """每筆事件存三張截圖，「是列車」的另外擷取短片。
+    截圖：列車＝車頭／中間／車尾；已排除＝車頭／變化最大／車尾（變化最大那一刻最看得出為什麼被排除，#60）。
+    短片（只有列車，#60）：事件前後各 clip_before／clip_after 秒；事件超過 LONG_CLIP 秒時只做
+    「車頭前 clip_before～車頭後 CLIP_PART 秒」＋「車尾前 CLIP_PART 秒～車尾後 clip_after」兩段接在一起（#59）。
+    跨幾支影片都照畫面時間切成每支影片的一段，依序接起來（v1.0.8 以前只接開始與結束兩支，中間的會漏掉，#54）。
+    files／bases：影片處理順序與每支的時間起點（判讀時的時間對照）。"""
     shot_dir = os.path.join(out_dir, '截圖'); os.makedirs(shot_dir, exist_ok=True)
     clip_dir = os.path.join(out_dir, '短片')
     if profile.make_clips:
@@ -529,30 +756,48 @@ def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None,
         for f in (ev['start_file'], ev['end_file']):
             if f not in order:
                 order.append(f)
+    tl = _timeline(list(files or []), bases, events) if bases else {}
+    for f, v in _timeline([], None, events).items():    # 沒給 bases，或事件裡的影片不在 files 裡 → 從事件反推
+        tl.setdefault(f, v)
     shots = {f: [] for f in order}       # 檔案 → [(秒數, 事件, 標籤)]
     clips = {f: [] for f in order}       # 檔案 → [(開始秒, 結束秒, 事件, 第幾段)]
     last_file = {}                       # 事件 id → 短片最後一段所在的檔案
     for ev in events:
-        ev['tag'] = '%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no']
+        # 檔名前綴第一次產生後就固定（media_tag）：之後改成列車、編號重排再重做，也不會蓋到別筆的截圖與短片
+        ev['tag'] = ev.get('media_tag') or ('%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no'])
+        ev['media_tag'] = ev['tag']
         ev['shots'], ev['clip'] = [], ''
-        same = ev['start_file'] == ev['end_file']
-        mid = (ev['start_pos'] + ev['end_pos']) / 2 if same else ev['start_pos'] + 1.0
-        shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭'))
-        shots[ev['start_file']].append((mid, ev, '2中間'))
-        shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾'))
-        if profile.make_clips:
-            if same:
-                clips[ev['start_file']].append((max(0.0, ev['start_pos'] - profile.clip_before), ev['end_pos'] + profile.clip_after, ev, 0))
-            else:
-                clips[ev['start_file']].append((max(0.0, ev['start_pos'] - profile.clip_before), 1e9, ev, 0))
-                clips[ev['end_file']].append((0.0, ev['end_pos'] + profile.clip_after, ev, 1))
-            last_file[id(ev)] = ev['end_file']
+        # 車頭／車尾未確認時，截圖名稱不寫「車頭／車尾」，避免人工覆核時誤以為是確定的時間（#70）
+        shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭' if ev.get('start_known', True) else '1第一畫面_車頭未確認'))
+        if ev.get('valid') or not ev.get('peak_file'):
+            m = _at(tl, order, (ev['start'] + ev['end']) / 2)
+            if m is None:                 # 中間落在缺口：用車頭那支影片
+                m = (ev['start_file'], ev['start_pos'] + 1.0)
+            shots[m[0]].append((m[1], ev, '2中間'))
+        else:
+            shots[ev['peak_file']].append((ev['peak_pos'], ev, '2變化最大'))
+        shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾' if ev.get('end_known', True) else '3最後畫面_車尾未確認'))
+        if profile.make_clips and ev.get('valid'):
+            a, b = ev['start'] - profile.clip_before, ev['end'] + profile.clip_after
+            spans = [(a, b)] if ev['end'] - ev['start'] <= LONG_CLIP else \
+                [(a, ev['start'] + CLIP_PART), (ev['end'] - CLIP_PART, b)]
+            seg = 0
+            for sa, sb in spans:
+                for f in order:
+                    if f not in tl:
+                        continue
+                    fb, fd = tl[f]
+                    lo, hi = max(sa, fb), min(sb, fb + (fd if fd > 0 else 1e9))
+                    if hi > lo:
+                        clips.setdefault(f, []).append((lo - fb, hi - fb, ev, seg))
+                        last_file[id(ev)] = f
+                        seg += 1
     writers = {}                          # 事件 id → 短片寫入狀態
-    todo = [f for f in order if shots[f] or clips[f]]
+    todo = [f for f in order if shots.get(f) or clips.get(f)]
     for k, f in enumerate(todo):
         if cancel and cancel():
             break
-        _one_pass(f, sorted(shots[f], key=lambda x: x[0]), clips[f], profile, shot_dir, clip_dir, writers)
+        _one_pass(f, sorted(shots.get(f, []), key=lambda x: x[0]), clips.get(f, []), profile, shot_dir, clip_dir, writers)
         for ev_id in [e for e, lf in last_file.items() if lf == f and e in writers]:
             _close_clip(writers.pop(ev_id), clip_dir)
         if progress:

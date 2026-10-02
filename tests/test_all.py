@@ -161,6 +161,378 @@ class TestScenarios(unittest.TestCase):
         self.assertEqual(sum(len(e['shots']) for e in evs), 0)
 
 
+class TestRound2(unittest.TestCase):
+    """v1.0.9：GPT 第二輪檢查的問題（修正清單 #45～#62）。先寫測試確認問題存在，再修"""
+
+    def scene(self, name, seconds, **kw):
+        d = tempfile.mkdtemp()
+        f = os.path.join(d, name)
+        exp = selftest.make_scene(f, seconds, **kw)
+        return d, f, exp
+
+    def run_files(self, files, bases, prof=None, cancel=None):
+        prof = prof or core.Profile()
+        return core.number_events(core.process(files, bases, prof, cancel=cancel)), prof
+
+    def valid(self, evs):
+        return [e for e in evs if e['valid']]
+
+    def test45_video_ends_with_train(self):
+        """#45 影片 20 秒，列車第 15 秒到達、第 22 秒才會離開 → 車尾不可以當成已確認"""
+        d, f, _ = self.scene('a.avi', 20, trains=[dict(t0=15, d=1, speed=40)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertTrue(v[0]['need_check'])
+        self.assertFalse(v[0].get('end_known', True))
+        self.assertIn('影片結束時列車仍在參考線上', v[0]['reason'])
+
+    def test45b_cancel_during_train(self):
+        """#45 判讀途中按取消、當時列車正在通過 → 車尾不可以當成已確認"""
+        d, f, _ = self.scene('a.avi', 40, trains=[dict(t0=5, d=1, speed=40)])
+        n = {'k': 0}
+        def cancel():
+            n['k'] += 1
+            return n['k'] > 3          # 每 30 格檢查一次 → 約第 6～8 秒取消
+        evs, _ = self.run_files([f], [0.0], cancel=cancel)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertTrue(v[0]['need_check'])
+        self.assertFalse(v[0].get('end_known', True))
+        self.assertIn('取消', v[0]['reason'])
+
+    def test46_static_limit_end_unknown(self):
+        """#46→#67 停住超過 max_static（測試用 15 秒）、影片結束時還沒開走 → 不提早結束（v1.0.10），
+        到影片結束才收尾，標「車尾未確認」與「長時間沒有動靜」"""
+        d, f, _ = self.scene('a.avi', 150, trains=[dict(t0=60, d=1, stops=[(61.0, 1000)])])
+        prof = core.Profile(); prof.max_static = 15
+        evs, _ = self.run_files([f], [0.0], prof)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertGreater(v[0]['end'], 145)
+        self.assertTrue(v[0]['need_check'])
+        self.assertFalse(v[0].get('end_known', True))
+        self.assertIn('車尾未確認', v[0]['reason'])
+        self.assertIn('長時間', v[0]['reason'])
+
+    def test47_static_limit_across_files(self):
+        """#47→#67 列車在 A 停住、B 整支還停著 → 一筆，從 A 到 B 結束（v1.0.10 起不再因 max_static 提早結束）；
+        影片內秒數不可以是負的"""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'a.avi'), os.path.join(d, 'b.avi')
+        selftest.make_scene(a, 150, trains=[dict(t0=60, d=1, stops=[(61.0, 1000)])])
+        selftest.make_scene(b, 40, trains=[dict(t0=-90, d=1, stops=[(-89.0, 1000)])])
+        prof = core.Profile(); prof.max_static = 100
+        evs, _ = self.run_files([a, b], [0.0, 150.0], prof)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end']) for e in v])
+        self.assertEqual(v[0]['start_file'], a)
+        self.assertEqual(v[0]['end_file'], b, v[0])
+        self.assertGreaterEqual(v[0]['end_pos'], 0.0)
+        self.assertFalse(v[0]['end_known'])
+        self.assertIn('長時間', v[0]['reason'])
+
+    def test49_gap_between_files(self):
+        """#49 A 結尾列車還在、B 在 50 分鐘後開始也有列車 → 不可以接成一筆；A 那筆車尾未確認"""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'a.avi'), os.path.join(d, 'b.avi')
+        selftest.make_scene(a, 20, trains=[dict(t0=15, d=1, speed=40)])
+        selftest.make_scene(b, 20, trains=[dict(t0=-3, d=1, speed=40)])
+        evs, _ = self.run_files([a, b], [0.0, 3000.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 2, [(e['start'], e['end']) for e in v])
+        self.assertLess(v[0]['end'], 25)
+        self.assertFalse(v[0].get('end_known', True))
+        self.assertIn('中斷', v[0]['reason'])
+        self.assertGreaterEqual(v[1]['start'], 3000.0)
+        self.assertTrue(v[1]['need_check'])
+
+    def test51_vertical_sunlight(self):
+        """#51 上下走向：陽光照亮（無車）→ 不可以有列車；陽光下有列車 → 時間正確"""
+        d, f, _ = self.scene('a.avi', 60, vertical=True, local_light=[(10, 50, 1.35)])
+        evs, _ = self.run_files([f], [0.0], selftest.vertical_profile())
+        self.assertEqual(self.valid(evs), [])
+        d, f, exp = self.scene('b.avi', 60, vertical=True, trains=[dict(t0=25, d=-1)], local_light=[(10, 50, 1.35)])
+        evs, _ = self.run_files([f], [0.0], selftest.vertical_profile())
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end']) for e in v])
+        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.3)
+        self.assertLess(abs(v[0]['end'] - exp[0][1]), 0.4)
+        self.assertEqual(v[0]['direction'], '往上')
+
+    def test51b_vertical_band(self):
+        """#51 紋理比對的範圍要沿軌道方向加寬（上下走向＝往上下加寬）"""
+        p = selftest.vertical_profile()
+        det = core.Detector(p, core.work_crop(p, 360, 640))
+        ys, xs = np.nonzero(det.band)
+        ry, rx = np.nonzero(det.ref_mask)
+        self.assertGreaterEqual(ys.max() - ys.min(), ry.max() - ry.min() + 18)
+
+    def test53_ir_switch_no_train(self):
+        """#53 傍晚切到紅外線（無車）→ 不可以有列車"""
+        d, f, _ = self.scene('a.avi', 60, ir_at=20)
+        evs, _ = self.run_files([f], [0.0])
+        self.assertEqual(self.valid(evs), [], [(e['start'], e['end'], e['reason']) for e in evs])
+
+    def test53b_ir_switch_then_train(self):
+        """#53 切到紅外線之後來一列車 → 要判讀到，時間正確"""
+        d, f, exp = self.scene('a.avi', 60, ir_at=15, trains=[dict(t0=35, d=1)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end'], e['reason']) for e in evs])
+        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.5)
+        self.assertLess(abs(v[0]['end'] - exp[0][1]), 0.6)
+
+    def test56_train_standing_at_start(self):
+        """#56 第一支影片一開頭列車就停在參考線上。
+        停 10 秒：時間要對、標需確認（影片一開始就有車）。
+        停 60、100 秒（超過開頭取樣的一半）：分不出列車是開頭停著還是後來停進來，不可以默默給時間，要標「背景不確定」"""
+        for stop in (10, 60, 100):
+            d, f, exp = self.scene('a.avi', 300, trains=[dict(t0=-1, d=1, stops=[(0.0, stop)])])
+            evs, _ = self.run_files([f], [0.0])
+            v = self.valid(evs)
+            self.assertGreaterEqual(len(v), 1, (stop, [(e['start'], e['end'], e['valid'], e['reason']) for e in evs]))
+            self.assertTrue(all(e['need_check'] for e in v), stop)
+            if stop == 10:
+                self.assertEqual(len(v), 1)
+                self.assertLess(v[0]['start'], 1.0)
+                self.assertLess(abs(v[0]['end'] - exp[0][1]), 0.6, (stop, v[0]['end'], exp))
+            else:
+                self.assertTrue(all('背景不確定' in e['reason'] for e in v), (stop, [e['reason'] for e in v]))
+
+    def clip_seconds(self, path):
+        import cv2
+        c = cv2.VideoCapture(path)
+        n, fps = c.get(cv2.CAP_PROP_FRAME_COUNT), c.get(cv2.CAP_PROP_FPS)
+        c.release()
+        return n / fps
+
+    def test54_clip_three_files(self):
+        """#54 列車停住、事件跨 A、B、C 三支影片 → 短片要包含中間的 B"""
+        d = tempfile.mkdtemp()
+        fs = [os.path.join(d, x + '.avi') for x in 'abc']
+        for i, f in enumerate(fs):
+            selftest.make_scene(f, 15, trains=[dict(t0=10 - 15 * i, d=1, stops=[(11.0 - 15 * i, 25)])])
+        evs, prof = self.run_files(fs, [0.0, 15.0, 30.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end']) for e in v])
+        dur = v[0]['end'] - v[0]['start']
+        out = os.path.join(d, 'out')
+        core.save_frames_and_clips(evs, prof, out, files=fs, bases=[0.0, 15.0, 30.0])
+        sec = self.clip_seconds(os.path.join(out, '短片', v[0]['clip']))
+        self.assertLess(abs(sec - (dur + 6)), 1.0, (sec, dur))
+
+    def test59_long_event_clip(self):
+        """#59 超過 60 秒的事件：短片只有車頭前後、車尾前後兩段（各 3＋10 秒）"""
+        d, f, exp = self.scene('a.avi', 200, trains=[dict(t0=60, d=1, stops=[(61.0, 80)])])
+        evs, prof = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1)
+        self.assertGreater(v[0]['end'] - v[0]['start'], 60)
+        out = os.path.join(d, 'out')
+        core.save_frames_and_clips(evs, prof, out, files=[f], bases=[0.0])
+        sec = self.clip_seconds(os.path.join(out, '短片', v[0]['clip']))
+        self.assertLess(abs(sec - 26), 1.0, sec)
+        self.assertEqual(len(v[0]['shots']), 3)
+
+    def test60b_media_tag_no_overwrite(self):
+        """#60 已排除改成列車後補做短片：用原本的檔名前綴（X001），不可以蓋到其他列車的截圖與短片"""
+        d, f, _ = self.scene('a.avi', 40, trains=[dict(t0=5, d=1)], blobs=[(25, 28, 335, 190, 22)])
+        evs, prof = self.run_files([f], [0.0])
+        out = os.path.join(d, 'out')
+        core.save_frames_and_clips(evs, prof, out, files=[f], bases=[0.0])
+        x = next(e for e in evs if not e['valid'])
+        t = next(e for e in evs if e['valid'])
+        before = os.path.getmtime(os.path.join(out, '短片', t['clip']))
+        x['valid'] = True
+        core.number_events(evs)                   # 編號重排：x 變成第 2 筆
+        core.save_frames_and_clips([x], prof, out, files=[f], bases=[0.0])
+        self.assertEqual(x['clip'], 'X001.mp4')
+        self.assertTrue(all(s.startswith('X001_') for s in x['shots']))
+        self.assertEqual(os.path.getmtime(os.path.join(out, '短片', t['clip'])), before)
+
+    def test60_excluded_no_clip_peak_shot(self):
+        """#60 已排除的事件：不產生短片；截圖有一張是「變化最大」的那一刻（看得出排除原因）"""
+        d, f, _ = self.scene('a.avi', 30, blobs=[(10, 13, 335, 190, 22)])
+        evs, prof = self.run_files([f], [0.0])
+        x = [e for e in evs if not e['valid']]
+        self.assertGreaterEqual(len(x), 1, evs)
+        out = os.path.join(d, 'out')
+        core.save_frames_and_clips(evs, prof, out, files=[f], bases=[0.0])
+        self.assertEqual(x[0]['clip'], '')
+        self.assertTrue(any('變化最大' in s for s in x[0]['shots']), x[0]['shots'])
+        self.assertTrue(all(os.path.exists(os.path.join(out, '截圖', s)) for s in x[0]['shots']))
+
+
+class TestRound3(unittest.TestCase):
+    """v1.0.10：GPT 第三輪檢查的問題（修正清單 #66～#70）。先寫測試確認問題存在，再修"""
+    scene = TestRound2.scene
+    run_files = TestRound2.run_files
+    valid = TestRound2.valid
+
+    def test66a_video_end_while_confirming(self):
+        """#66 車尾看起來離開了，但還沒等滿確認時間影片就結束 → 車尾未確認"""
+        d, f, exp = self.scene('a.avi', 20, trains=[dict(t0=17, d=1)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertLess(abs(v[0]['end'] - exp[0][1]), 0.4)          # 時間照樣保留最後看到的車尾
+        self.assertFalse(v[0]['end_known']); self.assertTrue(v[0]['need_check'])
+        self.assertIn('確認時間', v[0]['reason'])
+
+    def test66b_cancel_while_confirming(self):
+        """#66 按取消時正在等確認 → 車尾未確認"""
+        d, f, exp = self.scene('a.avi', 30, trains=[dict(t0=13, d=1)])   # 車尾約 15.2 秒離開
+        n = {'k': 0}
+        def cancel():
+            n['k'] += 1
+            return n['k'] >= 8          # 每 30 格（2 秒）檢查一次 → 第 16 秒取消
+        evs, _ = self.run_files([f], [0.0], cancel=cancel)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertFalse(v[0]['end_known']); self.assertTrue(v[0]['need_check'])
+
+    def test66c_gap_while_confirming(self):
+        """#66 錄影中斷時正在等確認 → 車尾未確認"""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'a.avi'), os.path.join(d, 'b.avi')
+        selftest.make_scene(a, 20, trains=[dict(t0=17, d=1)])
+        selftest.make_scene(b, 20)
+        evs, _ = self.run_files([a, b], [0.0, 3000.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, evs)
+        self.assertFalse(v[0]['end_known']); self.assertTrue(v[0]['need_check'])
+
+    def test66d_normal_end_still_known(self):
+        """#66 正常離開、後面有足夠的無車畫面 → 車尾已確認（不可以改壞）"""
+        d, f, exp = self.scene('a.avi', 20, trains=[dict(t0=5, d=1)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]['end_known']); self.assertFalse(v[0]['need_check'])
+
+    def test67a_stop_longer_than_max_static(self):
+        """#67 停得比 max_static（測試用 15 秒）久，之後開走 → 只有一筆，包含整段停車，車尾已確認"""
+        d, f, exp = self.scene('a.avi', 150, trains=[dict(t0=60, d=1, stops=[(61.0, 30)])])
+        prof = core.Profile(); prof.max_static = 15
+        evs, _ = self.run_files([f], [0.0], prof)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end'], e['reason']) for e in v])
+        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.3)
+        self.assertLess(abs(v[0]['end'] - exp[0][1]), 0.4)
+        self.assertTrue(v[0]['end_known'])
+        self.assertTrue(v[0]['need_check'])
+        self.assertIn('長時間', v[0]['reason'])
+
+    def test67b_camera_moved_during_train(self):
+        """#67 列車經過時攝影機被碰歪（畫面整個移動）→ 那一筆在偵測到時結束（車尾未確認、備註寫攝影機），
+        之後來的列車要判讀得到（不可以整段卡成一筆，後面的列車全部漏掉）"""
+        d, f, exp = self.scene('a.avi', 260, trains=[dict(t0=150, d=1, speed=40), dict(t0=220, d=-1)],
+                               camera_shift=(151, 14, 9, 1.5), texture=3000)
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        info = [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason'][:50]) for e in evs]
+        self.assertTrue(any(abs(e['start'] - 220) < 0.5 for e in v), info)
+        first = next(e for e in v if abs(e['start'] - 150) < 1.0)
+        self.assertFalse(first['end_known'], info)
+        self.assertIn('攝影機', first['reason'])
+        self.assertLess(first['end'], 200, info)
+
+    def test67c_idle_camera_moved(self):
+        """#67 沒有列車時攝影機被碰歪 → 不可以產生列車；之後的列車照常判讀"""
+        d, f, exp = self.scene('a.avi', 240, trains=[dict(t0=200, d=1)], camera_shift=(120, 14, 9, 1.5), texture=3000)
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end'], e['reason']) for e in v])
+        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.5)
+
+    def test68_time_jump_in_middle_file(self):
+        """#68 事件跨 A、B、C，只有中間的 B 畫面時間跳動 → 也要標需確認"""
+        try:
+            from trainwatch import gui
+        except Exception as e:
+            self.skipTest(str(e))
+        ev = dict(valid=True, start_file='A', end_file='C', reason='', need_check=False)
+        gui.mark_time_jumps([ev], ['A', 'B', 'C'], [dict(msg=''), dict(msg='影片中的畫面時間有跳動'), dict(msg='')])
+        self.assertTrue(ev['need_check'])
+
+    def test69_time_goes_back(self):
+        """#69 實際讀完 A 是 0～20 秒，B 的開始時間卻是 15 秒（倒退／重疊）→ 停止判讀並說明"""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'a.avi'), os.path.join(d, 'b.avi')
+        selftest.make_scene(a, 20); selftest.make_scene(b, 20)
+        with self.assertRaises(core.TimeOrderError) as cm:
+            core.process([a, b], [0.0, 15.0], core.Profile())
+        self.assertIn('b.avi', str(cm.exception))
+
+    def test69b_continuous_files_ok(self):
+        """#69 正常連續（誤差 1 秒內）的影片照常判讀，跨檔案的列車仍是一筆"""
+        d = tempfile.mkdtemp()
+        a, b = os.path.join(d, 'a.avi'), os.path.join(d, 'b.avi')
+        selftest.make_scene(a, 20, trains=[dict(t0=18, d=1)])
+        selftest.make_scene(b, 20, trains=[dict(t0=-2, d=1)])
+        evs, _ = self.run_files([a, b], [0.0, 19.6])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end']) for e in v])
+        self.assertTrue(v[0]['end_known'])
+
+    def test70_shot_names_when_unknown(self):
+        """#70 車尾未確認時最後一張叫「3最後畫面_車尾未確認」；影片一開始就有車時第一張叫「1第一畫面_車頭未確認」"""
+        d, f, exp = self.scene('a.avi', 20, trains=[dict(t0=-1, d=1), dict(t0=16, d=1)])
+        evs, prof = self.run_files([f], [0.0])
+        out = os.path.join(d, 'out')
+        core.save_frames_and_clips(evs, prof, out, files=[f], bases=[0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 2, [(e['start'], e['end']) for e in v])
+        self.assertTrue(any('1第一畫面_車頭未確認' in s for s in v[0]['shots']), v[0]['shots'])
+        self.assertTrue(any('3最後畫面_車尾未確認' in s for s in v[1]['shots']), v[1]['shots'])
+
+
+class TestRound2Gui(unittest.TestCase):
+    """v1.0.9：介面這邊的檢查函式（不開視窗）"""
+    def setUp(self):
+        try:
+            from trainwatch import gui
+        except Exception as e:
+            self.skipTest(str(e))
+        self.gui = gui
+
+    def test48_final_order(self):
+        """#48 正式校正後順序和清單不同 → 依時間排序；重疊超過 2 秒 → 列出來（不能判讀）"""
+        d, f, _ = TestRound2.scene(self, 'a.avi', 10)
+        files = [f + '1', f + '2', f + '3']
+        for x in files:
+            os.link(f, x) if not os.path.exists(x) else None
+        tm = [dict(offset=1000.0), dict(offset=0.0), dict(offset=500.0)]
+        fs, t2, note, ov = self.gui.final_order(files, tm)
+        self.assertEqual([t['offset'] for t in t2], [0.0, 500.0, 1000.0])
+        self.assertEqual(fs, [files[1], files[2], files[0]])
+        self.assertTrue(note)
+        self.assertEqual(ov, [])
+        fs, t2, note, ov = self.gui.final_order(files, [dict(offset=0.0), dict(offset=5.0), dict(offset=500.0)])
+        self.assertEqual(len(ov), 1)            # 10 秒的影片，第二支 5 秒就開始 → 重疊
+        self.assertEqual(note, '')
+
+    def test52_time_jump_marks_events(self):
+        """#52 畫面時間跳動的影片：裡面的列車標需確認，備註寫原因"""
+        evs = [dict(valid=True, start_file='a', end_file='a', reason='', need_check=False),
+               dict(valid=True, start_file='b', end_file='b', reason='', need_check=False)]
+        self.gui.mark_time_jumps(evs, ['a', 'b'], [dict(msg='影片中的畫面時間有跳動（9 個取樣對不上），請確認'), dict(msg='')])
+        self.assertTrue(evs[0]['need_check']); self.assertIn('畫面時間有跳動', evs[0]['reason'])
+        self.assertFalse(evs[1]['need_check'])
+
+    def test61_quality_summary(self):
+        """#61 品質摘要：需確認的原因分類計數、車尾未確認另外提醒"""
+        evs = [dict(valid=True, need_check=True, check_items=['方向不確定']),
+               dict(valid=True, need_check=True, end_known=False, check_items=['方向不確定', '影片結束時列車仍在參考線上（車尾未確認）']),
+               dict(valid=True, need_check=False), dict(valid=False)]
+        t = self.gui.quality_summary(evs)
+        self.assertIn('列車 3 筆、已排除 1 筆', t)
+        self.assertIn('方向不確定：2 筆', t)
+        self.assertIn('影片結束時列車仍在參考線上（車尾未確認）：1 筆', t)
+        self.assertIn('1筆「車尾未確認」', t)
+
+
 class TestExport(unittest.TestCase):
     def test_noise_txt(self):
         d = tempfile.mkdtemp()
@@ -324,7 +696,7 @@ class TestSamples(unittest.TestCase):
                     self.assertLess(e['end'] - e['start'], 30, (f, core.fmt_time(e['start']), core.fmt_time(e['end'])))
 
     def test_shots_and_clips_every_sample(self):
-        """每支樣本影片（含每秒實際格數和檔頭不符的）：每一筆都要有 3 張截圖和短片，
+        """每支樣本影片（含每秒實際格數和檔頭不符的）：每一筆都要有 3 張截圖；列車要有短片，已排除的不產生短片（#60），
         而且車頭截圖上的畫面時間要和判讀的車頭時間一致（差 1 秒內）"""
         root = os.environ['TW_SAMPLES']
         import cv2
@@ -334,10 +706,14 @@ class TestSamples(unittest.TestCase):
             prof = core.Profile()
             evs = [e for e in core.number_events(core.process([f], [r['offset']], prof)) if e['end'] - e['start'] >= 0.6]
             out = tempfile.mkdtemp()
-            core.save_frames_and_clips(evs, prof, out, files=[f])
+            core.save_frames_and_clips(evs, prof, out, files=[f], bases=[r['offset']])
             for e in evs:
                 self.assertEqual(len(e['shots']), 3, (f, core.fmt_time(e['start'])))
-                self.assertTrue(e['clip'] and os.path.getsize(os.path.join(out, '短片', e['clip'])) > 0, (f, core.fmt_time(e['start'])))
+                if e['valid']:
+                    self.assertTrue(e['clip'] and os.path.getsize(os.path.join(out, '短片', e['clip'])) > 0, (f, core.fmt_time(e['start'])))
+                else:
+                    self.assertEqual(e['clip'], '')
+                    self.assertTrue(any('變化最大' in x for x in e['shots']), e['shots'])
                 img = cv2.imdecode(np.fromfile(os.path.join(out, '截圖', e['shots'][0]), np.uint8), cv2.IMREAD_COLOR)
                 d, txt, _w = osd.read_datetime(img, osd.DEFAULT_RECT, osd.DEFAULT_FORMAT, T)
                 self.assertIsNotNone(d, (f, txt))
