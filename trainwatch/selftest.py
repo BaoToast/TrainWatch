@@ -49,7 +49,8 @@ def make_video(path, seconds=40.0, trains=((5.0, +1), (22.0, -1)), speed=120.0, 
     return [(t0, t0 + length / speed, d) for t0, d in trains]   # 預期 (車頭到達, 車尾離開, 方向)
 
 
-def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2, vertical=False, ir_at=None, camera_shift=None, texture=400):
+def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2, vertical=False, ir_at=None, camera_shift=None, texture=400,
+               cam_path=None):
     """較完整的假影片（驗收測試用）。
     trains：dict(t0=車頭碰到參考線 x=350 的秒數, d=+1 往右／-1 往左, speed=像素／秒, length=車長像素,
                  y=(上, 下), stops=[(開始停的秒數, 停多久), …], car=每節車廂長, gap=車廂間空隙像素)
@@ -60,6 +61,8 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), 
     ir_at：從這一秒起畫面變成紅外線模式（黑白、對比和亮度都不同），模擬傍晚攝影機切換
     camera_shift：(秒, dx, dy, 轉幾度)，從這一秒起整個畫面移動／轉動，模擬攝影機被碰歪
     texture：背景上的圓點數（越多紋理越密，像真實的樹叢、電線桿）
+    cam_path：[(秒, dx, dy, 轉幾度, 縮放), …]，攝影機位置隨時間慢慢改變（中間線性內插；轉動、縮放可省略），
+              模擬攝影機慢慢偏移、晃動、變焦（#83、#84）
     回傳每列車預期的 (車頭到達, 車尾離開)"""
     import cv2
     rng = np.random.default_rng(seed)
@@ -124,6 +127,22 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), 
             M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, 1.0)
             M[0, 2] += dx; M[1, 2] += dy
             out = cv2.warpAffine(out, M, (W, H), borderMode=cv2.BORDER_REFLECT)
+        if cam_path:
+            ks = [tuple(k) + (0.0, 1.0)[len(k) - 3:] if len(k) < 5 else tuple(k) for k in cam_path]
+            if t <= ks[0][0]:
+                cur = ks[0][1:]
+            elif t >= ks[-1][0]:
+                cur = ks[-1][1:]
+            else:
+                j = next(j for j in range(1, len(ks)) if ks[j][0] >= t)
+                a_, b_ = ks[j - 1], ks[j]
+                u = (t - a_[0]) / (b_[0] - a_[0])
+                cur = tuple(a_[q] + (b_[q] - a_[q]) * u for q in range(1, 5))
+            dx, dy, ang, sc = cur
+            if dx or dy or ang or sc != 1.0:
+                M = cv2.getRotationMatrix2D((W / 2, H / 2), ang, sc)
+                M[0, 2] += dx; M[1, 2] += dy
+                out = cv2.warpAffine(out, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
         if vertical:
             out = np.ascontiguousarray(out.transpose(1, 0, 2))
         wr.write(out)

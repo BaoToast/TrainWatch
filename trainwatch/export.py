@@ -34,10 +34,13 @@ def clean(ev):
     return d
 
 
-def save_json(path, events, profile: Profile, files, timing):
+def save_json(path, events, profile: Profile, files, timing, app_version=None):
     """timing：每個檔案的時間對照 [{'offset':…, 'source':'畫面字幕'/'手動', 'msg':…}]"""
-    data = dict(app='列車通過判讀', version=2, saved=dt.datetime.now().isoformat(timespec='seconds'),
-                profile=json.loads(profile.to_json()), files=list(files), timing=list(timing),
+    prof = json.loads(profile.to_json())
+    anchors = prof.pop('camera_anchors', None) or []          # 位置基準的圖很大，結果檔只記張數（#82）
+    prof['camera_anchor_count'] = len(anchors)
+    data = dict(app='列車通過判讀', version=2, app_version=app_version, saved=dt.datetime.now().isoformat(timespec='seconds'),
+                profile=prof, files=list(files), timing=list(timing),
                 events=[clean(e) for e in events])
     tmp = path + '.tmp'
     with open(tmp, 'w', encoding='utf-8') as fh:
@@ -142,9 +145,9 @@ def write_excel(path, events, profile: Profile, files, timing):
             ['需人工確認筆數', sum(1 for e in valid if e.get('need_check') and not e.get('checked'))],
             ['已排除筆數', len(excl)],
             ['產生時間', dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')]]
-    stops = [tm.get('stop') for tm in timing if tm.get('stop')]
-    if stops:                                   # 攝影機位置改變而停止判讀（#71）
-        rows.insert(1, ['⚠ 判讀中途停止', stops[0].replace('\n', '')])
+    warns = [tm.get('warn') or tm.get('stop') for tm in timing if tm.get('warn') or tm.get('stop')]
+    if warns:                                   # 攝影機位置有問題、讀取出錯（#88；舊結果檔是 stop）
+        rows.insert(1, ['⚠ 判讀途中的狀況（之後的列車已標需確認）', '　'.join(w.replace('\n', '') for w in warns)])
     for r in rows:
         ws3.append(r)
     ws3.append([])
@@ -154,7 +157,7 @@ def write_excel(path, events, profile: Profile, files, timing):
         off = tm.get('offset')
         ws3.append([os.path.basename(f), fmt_time(off, True) if off is not None else '',
                     tm.get('source', ''), ('%d%%' % round(tm['support'] * 100)) if tm.get('support') is not None else '',
-                    '；'.join(x for x in (tm.get('msg', ''), tm.get('stop', '').replace('\n', ''),
+                    '；'.join(x for x in (tm.get('msg', ''), (tm.get('warn') or tm.get('stop') or '').replace('\n', ''),
                                          tm.get('cam_note', '')) if x)])
     for c, w in zip('ABCDE', (40, 26, 12, 14, 50)):
         ws3.column_dimensions[c].width = w

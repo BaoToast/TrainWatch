@@ -61,6 +61,9 @@ class Profile:
     osd_format: str = 'YYYY-MM-DD HH:MM:SS'
     osd_templates: list = None            # 「教程式認字」學到的字樣；None＝內建
     frame_size: list = None               # 畫參考線時的畫面大小 [寬, 高]；影片大小不同時要警告
+    camera_anchors: list = None           # 攝影機位置基準（#82）：畫參考線時、與之後使用者確認過位置的畫面
+                                          # （灰階小圖，make_anchor 產生）。判讀前和判讀途中拿來確認攝影機沒有移動
+    profile_version: int = 2              # 監測站設定的格式版本（2＝v1.0.13 起，有 camera_anchors）
 
     def to_json(self):
         return json.dumps(dataclasses.asdict(self), ensure_ascii=False, indent=2)
@@ -71,6 +74,10 @@ class Profile:
         for k, v in (d or {}).items():
             if hasattr(p, k):
                 setattr(p, k, v)
+        if not isinstance(p.camera_anchors, list):
+            p.camera_anchors = None
+        if 'profile_version' not in (d or {}):
+            p.profile_version = 1             # v1.0.12 以前存的：沒有攝影機位置基準
         return p
 
     def horizontal(self):
@@ -91,6 +98,174 @@ def fmt_time(ts: float, with_date=False) -> str:
     return (d.strftime('%Y-%m-%d ') + s) if with_date else s
 
 
+# ---------------------------------------------------------------- 攝影機幾何位置（#82～#85）
+# 用「固定物體的特徵點」（ORB＋RANSAC，OpenCV 內建）量攝影機相對原位置偏了多少：
+# 電線桿、山稜線、建築的角點前後一致，樹葉晃動的點對不上，會被 RANSAC 排除。
+# 真實樣本實測（v1.0.13）：
+#   - 同一支影片 10 分鐘內：每次都比得起來（符合的點 127～1227 個），量到的偏移最大 0.8 像素。
+#   - 夜間（紅外線）不同時間（相隔約 5 小時）：比得起來，偏移 ≤ 0.1 像素。
+#   - 白天上午和下午、白天和夜間：比不起來（符合的點 ≤ 27 個）→ 當成「無法確認」，不會當成移動。
+#   - 人為平移 3、6 像素：量到 2.9～3.1、5.9～6.1；轉 1.5 度：參考線一帶量到約 1 像素。
+# 量的是「參考線兩端、中點與軌道範圍四個角」實際偏了幾像素（最大的那一個），所以平移、轉動、變焦都算得到。
+# （v1.0.12 的相位相關只能量平移，而且白天幾分鐘後就比不起來：樹葉一動，r 會掉到 0.05 左右）
+GEO_STEP = 30.0       # 判讀途中每幾秒比一次（一次約 50 毫秒，24 小時約多 2 分鐘）
+GEO_OK = 40           # 符合的特徵點至少幾個才算比得起來
+GEO_REHOME = 80       # 少於這個數（光線慢慢改變）就換新的比較畫面，累積的偏移量保留（不會歸零）
+GEO_SAME = 3.0        # 偏移小於幾像素＝位置相同
+GEO_MOVE = 6.0        # 偏移幾像素以上＝移動（6 像素在參考線上約差 0.02～0.06 秒；門檻依真實樣本的量測雜訊訂）
+GEO_STALE = 300.0     # 判讀途中超過幾秒都比不起來（也比不上監測站基準）→ 記下「無法確認位置」，之後的列車標需確認（#84、#88）
+_ORB = []
+
+
+def _geo_mask(profile, w, h):
+    m = np.full((h, w), 255, np.uint8)
+    x0, y0, x1, y1 = profile.track_rect
+    m[max(0, int(min(y0, y1)) - 20):int(max(y0, y1)) + 21, max(0, int(min(x0, x1)) - 20):int(max(x0, x1)) + 21] = 0
+    m[:40] = 0                     # 上方時間字幕
+    return m
+
+
+def geo_points(profile):
+    """要確認位置的點：參考線兩端與中點、軌道範圍四個角"""
+    (xa, ya), (xb, yb) = profile.ref_line
+    x0, y0, x1, y1 = profile.track_rect
+    return np.float32([[xa, ya], [xb, yb], [(xa + xb) / 2, (ya + yb) / 2], [x0, y0], [x1, y0], [x0, y1], [x1, y1]])
+
+
+def geo_features(frame_bgr, profile):
+    """回傳 (點座標 N×2, 描述子) 或 None"""
+    if frame_bgr is None:
+        return None
+    if not _ORB:
+        _ORB.append(cv2.ORB_create(1500, fastThreshold=10))
+        _ORB.append(cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True))
+    g = frame_bgr if frame_bgr.ndim == 2 else cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    g = cv2.equalizeHist(g)
+    kp, des = _ORB[0].detectAndCompute(g, _geo_mask(profile, g.shape[1], g.shape[0]))
+    if des is None or len(kp) < GEO_OK:
+        return None
+    return np.float32([k.pt for k in kp]), des
+
+
+def geo_compare(a, b, profile):
+    """a 的畫面到 b 的畫面：回傳 dict(n＝符合的點數, off＝各確認點的偏移 K×2)；比不起來回傳 None"""
+    if a is None or b is None:
+        return None
+    ms = _ORB[1].match(a[1], b[1])
+    if len(ms) < GEO_OK:
+        return None
+    pa = a[0][[m.queryIdx for m in ms]]
+    pb = b[0][[m.trainIdx for m in ms]]
+    M, inl = cv2.estimateAffinePartial2D(pa, pb, method=cv2.RANSAC, ransacReprojThreshold=2.0, maxIters=3000)
+    if M is None:
+        return None
+    n = int(inl.sum())
+    if n < GEO_OK:
+        return None
+    pts = geo_points(profile)
+    off = pts @ M[:, :2].T + M[:, 2] - pts
+    return dict(n=n, off=off)
+
+
+def geo_disp(off):
+    return float(np.max(np.hypot(off[:, 0], off[:, 1]))) if off is not None else None
+
+
+def geo_verdict(res, off=None):
+    """same／moved／uncertain（比不起來、或偏移在 3～6 像素之間 → 無法確認）"""
+    if res is None:
+        return 'uncertain'
+    d = geo_disp(res['off'] if off is None else off)
+    return 'same' if d < GEO_SAME else ('moved' if d >= GEO_MOVE else 'uncertain')
+
+
+def make_anchor(frame_bgr, note=''):
+    """攝影機位置基準：灰階畫面（JPEG，約 100 KB）＋彩度（白天／紅外線）＋建立時間"""
+    import base64
+    g = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2GRAY)
+    ok, buf = cv2.imencode('.jpg', g, [cv2.IMWRITE_JPEG_QUALITY, 85])
+    sat = float(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+    return dict(jpg=base64.b64encode(buf.tobytes()).decode('ascii'), sat=round(sat, 1),
+                saved=dt.datetime.now().isoformat(timespec='seconds'), note=note)
+
+
+def anchor_image(a):
+    import base64
+    try:
+        return cv2.imdecode(np.frombuffer(base64.b64decode(a['jpg']), np.uint8), cv2.IMREAD_GRAYSCALE)
+    except Exception:
+        return None
+
+
+MAX_ANCHORS = 8
+
+
+def add_anchor(anchors, a):
+    """加一張位置基準；最多 MAX_ANCHORS 張（第一張＝儲存監測站時的畫面一定保留，其餘留最新的）"""
+    out = list(anchors or []) + [a]
+    if len(out) > MAX_ANCHORS:
+        out = out[:1] + out[-(MAX_ANCHORS - 1):]
+    return out
+
+
+def best_anchor(feats, anchor_feats, profile):
+    """和所有監測站基準比，取符合點數最多的。回傳 (結果 dict 或 None, 第幾個)"""
+    best, bi = None, None
+    for i, af in enumerate(anchor_feats):
+        r = geo_compare(af, feats, profile)
+        if r and (best is None or r['n'] > best['n']):
+            best, bi = r, i
+    return best, bi
+
+
+def frame_mode(frame_bgr, profile, prev=None):
+    sat = float(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+    return 'day' if sat >= profile.day_saturation else ('night' if sat < 12 else (prev or 'day'))
+
+
+def geo_frame_at(path, sec=1.0):
+    cap = cv2.VideoCapture(path)
+    try:
+        cap.set(cv2.CAP_PROP_POS_MSEC, sec * 1000)
+        ok, fr = cap.read()
+        if not ok:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, fr = cap.read()
+        return (fr, cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0) if ok else (None, 0.0)
+    finally:
+        cap.release()
+
+
+def check_start(files, profile, progress=None, cancel=None):
+    """判讀前確認攝影機位置（#82）：第一支影片、以及之後每次畫面在白天／紅外線之間切換的第一支，
+    拿影片第 1 秒的畫面和監測站的位置基準比。回傳 list of dict(file, pos, mode, verdict, n, disp, frame)：
+    verdict＝same／moved／uncertain；none＝監測站沒有位置基準（v1.0.12 以前存的、或還沒儲存）"""
+    anchors = [geo_features(anchor_image(a), profile) for a in (profile.camera_anchors or [])]
+    anchors = [a for a in anchors if a is not None]
+    out, mode = [], None
+    for i, f in enumerate(files):
+        if cancel and cancel():
+            break
+        fr, pos = geo_frame_at(f)
+        if progress:
+            progress(i / max(1, len(files)))
+        if fr is None:
+            continue
+        m = frame_mode(fr, profile, mode)
+        if out and m == mode:
+            continue
+        mode = m
+        feats = geo_features(fr, profile)
+        if not profile.camera_anchors:
+            res, v = None, 'none'
+        else:
+            res, _bi = best_anchor(feats, anchors, profile)
+            v = geo_verdict(res)
+        out.append(dict(file=f, pos=pos, mode=m, verdict=v, n=res['n'] if res else 0,
+                        disp=round(geo_disp(res['off']), 1) if res else None, frame=fr))
+    return out
+
+
 # ---------------------------------------------------------------- 判讀
 class CameraGuard:
     """攝影機位置基準（#75～#77）。和列車背景（Detector.bg）分開：
@@ -98,7 +273,9 @@ class CameraGuard:
       移動後的畫面會佔多數，反而把舊位置當成異常）。
     - 比較方法：cv2.phaseCorrelate（相位相關）算目前畫面相對基準「平移了幾像素」與可信度 r。
       用邊緣強度、再除以高位數正規化 → 整體亮度、曝光變化不影響。
-      真實樣本實測：同一光線下 5 秒～10 分鐘，平移 < 0.3 像素、r ≥ 0.74；人為平移 4×3、10×0 像素量得到誤差 < 0.5；
+      真實樣本實測：間隔 2 秒的畫面 r 約 0.85～0.96、平移 < 0.3 像素；但白天有風時，間隔越久 r 掉得越多
+      （幾分鐘後約 0.05，v1.0.12 說明寫成「間隔 10 分鐘 r ≥ 0.74」是錯的，v1.0.13 實測更正），所以只能和幾秒前的畫面比。
+      人為平移 4×3、10×0 像素量得到誤差 < 0.5；
       移動 14×9＋轉 1.5 度：量到 13～14 像素平移。
     - 判定「位置改變」：平移 ≥ MOVE_PX（6 像素）且 r ≥ 0.15 開始懷疑；之後量到的平移一直穩定（方向、大小差 < 3 像素），
       持續 HOLD 秒（有列車通過時 HOLD_EVENT 秒）就確認。
@@ -108,9 +285,14 @@ class CameraGuard:
       **疑似移動期間（suspect）完全不更新**；錄影中斷、重建列車背景也不更新（錄影中斷另外用 gap_check 比對）。
     - 超過 STALE 秒都沒辦法更新（r 一直很低，例如彩色↔紅外線切換、光線劇烈變化），但也沒有平移：重新建立基準，
       並記在 notes（品質摘要、Excel 會寫出來，不是默默發生）。
-    - 已知限制：只有轉動、幾乎沒有平移的碰撞偵測不到（轉 1.5 度時，畫面中央附近的參考線只移動約 1 像素）。"""
+    - v1.0.13 另外加上「幾何位置」這一層（#82～#85，見上面 GEO_*）：每 GEO_STEP 秒用固定物體的特徵點，
+      量參考線、軌道範圍相對**監測站儲存時的位置**（沒有監測站基準時：相對這批影片開頭）總共偏了幾像素。
+      上面的相位相關基準每 2 秒更新，只負責「突然被碰歪」（5 秒內確認）；它的更新**不會**把累積偏移歸零——
+      累積偏移由幾何這一層保留（換新的比較畫面時，偏移量加上去），所以慢慢偏移、轉動、變焦都抓得到。
+    - 超過 STALE 秒相位相關都比不起來：只有在幾何這一層剛確認過「位置相同」時，才重新建立相位相關基準（記在 notes）；
+      幾何這一層超過 GEO_STALE 秒都比不起來（也比不上監測站基準）→ 記下「無法確認位置」（#84），之後的列車標需確認（#88）。"""
     K = 2               # 畫面縮成 1/2 再比（320×180）
-    MOVE_PX = 6.0       # 平移幾像素（原始 640×360）以上算移動。6 像素在參考線上約差 0.02～0.06 秒，使用者可接受誤差是 5 秒
+    MOVE_PX = 6.0       # 平移幾像素（原始 640×360）以上算移動。門檻依真實樣本的量測雜訊訂（同一光線下 < 0.5 像素）
     HOLD = 5.0
     HOLD_EVENT = 5.0     # 列車在軌道範圍裡，比對時已經遮掉，所以和平常一樣
     UPDATE = 2.0
@@ -131,6 +313,19 @@ class CameraGuard:
         self.mode_t = -1e9
         self.notes = []
         self.last_result = None
+        # 幾何位置（#82～#85）
+        self.anchors = [a for a in (geo_features(anchor_image(x), profile) for x in (profile.camera_anchors or []))
+                        if a is not None]
+        self.has_anchors = bool(profile.camera_anchors)
+        self.home = None          # 比較用的畫面（特徵點）
+        self.home_off = None      # 那個畫面相對原位置的偏移（各確認點 K×2）
+        self.geo_last = -1e9
+        self.geo_ok_t = None      # 最後一次確認位置的時間
+        self.geo_off = None       # 目前相對原位置的偏移
+        self.geo_n = 0
+        self.geo_sus = None
+        self.geo_t0 = None
+        self.recover = None
 
     def _mask(self, w, h):
         k = self.K
@@ -160,9 +355,92 @@ class CameraGuard:
         out = (float(np.hypot(dx, dy)) * self.K, float(r))
         return out + ((dx * self.K, dy * self.K),) if vec else out
 
+    def _geo(self, t, frame_bgr, file, pos):
+        """幾何位置這一層。確認有問題時回傳 (時間, 影片, 秒數, kind, result)"""
+        self.geo_last = t
+        F = geo_features(frame_bgr, self.p)
+        if self.recover is not None:                # 「無法確認位置」之後：等到能和監測站基準確認為止
+            res, _ = best_anchor(F, self.anchors, self.p)
+            v = geo_verdict(res)
+            if v == 'same':
+                self.recover['until'] = t
+                self.recover = None
+                self.home, self.home_off, self.geo_ok_t, self.geo_off, self.geo_n = F, res['off'], t, res['off'], res['n']
+            elif v == 'moved':
+                self.recover = None
+                self.geo_off, self.geo_n = res['off'], res['n']
+                return (t, file, pos, 'drift', 'moved')
+            return None
+        if self.home is None:                       # 這批影片的第一格（比不起來時每 2 秒再試，最多 10 秒）
+            if self.geo_t0 is None:
+                self.geo_t0 = t
+            if self.has_anchors:
+                res, _ = best_anchor(F, self.anchors, self.p)
+                v = geo_verdict(res)
+                self.geo_n, self.geo_off = (res['n'], res['off']) if res else (0, None)
+                if v == 'moved' or (v == 'uncertain' and t - self.geo_t0 >= 10.0):
+                    # 和監測站儲存時的位置不同／無法確認：記下來（之後的列車標需確認，#88）
+                    return (self.geo_t0, file, pos, 'profile', v)
+                if v != 'same':
+                    return None
+                self.home, self.home_off = F, res['off']
+            elif F is not None:
+                self.home, self.home_off = F, np.zeros((len(geo_points(self.p)), 2), np.float32)
+            if self.home is not None:
+                self.geo_ok_t, self.geo_off = t, self.home_off
+            return None
+        if self.geo_ok_t is None:                   # 錄影中斷後（gap_check 已確認）
+            self.geo_ok_t = t
+        res = geo_compare(self.home, F, self.p)
+        if res is not None:
+            total = self.home_off + res['off']
+            if res['n'] < GEO_REHOME:               # 光線慢慢改變：換新的比較畫面，偏移量保留
+                self.home, self.home_off = F, total
+        else:
+            res, _ = best_anchor(F, self.anchors, self.p)
+            if res is None:                         # 比不起來
+                if t - self.geo_ok_t >= GEO_STALE:
+                    return (self.geo_ok_t, file, pos, 'uncertain', 'uncertain')
+                return None
+            total = res['off']
+            self.home, self.home_off = F, total
+        self.geo_ok_t, self.geo_off, self.geo_n = t, total, res['n']
+        if geo_disp(total) >= GEO_MOVE:            # 連續兩次（間隔 GEO_STEP 秒）都超過才確認
+            if self.geo_sus is None:
+                self.geo_sus = (t, file, pos)
+            elif t - self.geo_sus[0] >= GEO_STEP * 0.9:
+                return self.geo_sus + ('drift', 'moved')
+        else:
+            self.geo_sus = None
+        return None
+
+    def rebase(self, recover=None):
+        """攝影機位置有問題、已記錄之後：以接下來的畫面為新的基準，之後再改變也抓得到。
+        recover＝「無法確認位置」那一筆紀錄：繼續拿監測站基準比，之後確認位置相同就記下 until（從那時起的列車不再標需確認）；
+        確認不了的時候不重複記錄。突然移動、慢慢偏移（位置真的變了）：不再和監測站基準比"""
+        self.ref, self.ref_t, self.build, self.build_t0 = None, None, [], None
+        self.suspect, self.last = None, -1e9
+        self.home = self.home_off = self.geo_off = None
+        self.geo_sus, self.geo_t0, self.geo_ok_t, self.geo_last = None, None, None, -1e9
+        self.recover = recover if self.anchors else None
+        if self.recover is None:
+            self.anchors, self.has_anchors = [], False
+
+    def geo_verified(self, t):
+        """幾何這一層剛確認過位置相同（相位相關基準可以重建）"""
+        return (self.geo_ok_t is not None and t - self.geo_ok_t <= GEO_STEP + 1.0
+                and self.geo_off is not None and geo_disp(self.geo_off) < GEO_SAME)
+
     def check(self, t, frame_bgr, sat, active, file, pos):
-        """每一格呼叫。確認位置改變時回傳 (改變開始的時間, 影片, 秒數)，否則 None"""
-        if frame_bgr is None or t - self.last < self.STEP:
+        """每一格呼叫。確認位置改變／無法確認時回傳 (時間, 影片, 秒數, kind, result)，否則 None。
+        kind：moved＝突然被碰歪；drift＝慢慢偏移、轉動、變焦；profile＝和監測站儲存時的位置不同；uncertain＝無法確認"""
+        if frame_bgr is None:
+            return None
+        if t - self.geo_last >= (GEO_STEP if self.home is not None else 2.0):
+            hit = self._geo(t, frame_bgr, file, pos)
+            if hit:
+                return hit
+        if t - self.last < self.STEP:
             return None
         self.last = t
         mode = 'day' if sat >= self.p.day_saturation else ('night' if sat < 12 else self.mode)
@@ -179,7 +457,7 @@ class CameraGuard:
                 self.ref, self.ref_t, self.build = np.median(np.stack(self.build), axis=0).astype(np.float32), t, []
             return None
         shift, r, v = self.compare(self.ref, cur, vec=True)
-        self.last_result = (shift, r)
+        self.last_phase = (shift, r)
         # 疑似移動：第一次要 r ≥ 0.15；之後只要量到的平移方向、大小一直差不多（< 3 像素），就算 r 變低也持續
         # （基準停在移動前，樹葉晃動會讓 r 越來越低，但真正的平移量會一直穩定；雜訊造成的假平移每次都不一樣）
         start = shift >= self.MOVE_PX and r >= 0.15
@@ -189,47 +467,42 @@ class CameraGuard:
             if self.suspect is None:
                 self.suspect, self.suspect_v = (t, file, pos), v
             if t - self.suspect[0] >= (self.HOLD_EVENT if active else self.HOLD):
-                return self.suspect
+                return self.suspect + ('moved', 'moved')
             return None                       # 疑似移動期間不更新基準
         self.suspect = None
         if shift < 1.0 and r >= 0.3:
             if t - self.ref_t >= self.UPDATE:
                 self.ref, self.ref_t = cur, t
-        elif t - self.ref_t >= self.STALE and shift < 3.0:
+        elif t - self.ref_t >= self.STALE and shift < 3.0 and self.geo_verified(t):
+            # 只有在幾何這一層剛確認過位置相同時才重建（#84）；確認不了就不重建，交給幾何這一層判斷
             self.ref, self.ref_t = cur, t
             why = ('切換為%s' % ('紅外線（黑白）' if self.mode == 'night' else '彩色')) if t - self.mode_t < self.STALE + 5 \
                 else '畫面變化很大'
-            self.notes.append(dict(file=file, t=t, text='%s：%s（%s）' % (fmt_time(t), why, os.path.basename(file or ''))))
+            self.notes.append(dict(file=file, t=t, text='%s：%s（%s），用固定物體確認位置相同' % (fmt_time(t), why, os.path.basename(file or ''))))
         return None
 
     def gap_check(self, path):
-        """錄影中斷後：拿中斷前最後的基準，和下一支影片前 2 秒的畫面比對。回傳 'same'／'moved'／'uncertain'。
-        same＝確認位置一致（基準換成新影片的畫面，繼續判讀）；moved／uncertain＝停止判讀（不知道就不默默繼續）"""
-        if self.ref is None:
-            return 'same'
-        frames = []
-        cap = cv2.VideoCapture(path)
-        try:
-            while len(frames) < 5:
-                ok, fr = cap.read()
-                if not ok:
-                    break
-                p = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-                if p >= len(frames) * 0.4:
-                    frames.append(self.prep(fr))
-        finally:
-            cap.release()
-        if len(frames) < 3:
+        """錄影中斷後：拿中斷前的位置（幾何這一層），和下一支影片的畫面比對；比不起來再和監測站基準比。
+        回傳 'same'／'moved'／'uncertain'。same＝確認位置一致（比較畫面換成新影片的，繼續判讀）；
+        moved／uncertain＝記下來、之後的列車標需確認（不知道就不默默當成沒事，#88）。還沒有任何位置可以比（#85）＝uncertain"""
+        if self.home is None and not self.anchors:
+            self.last_result = (0.0, 0)
             return 'uncertain'
-        new = np.median(np.stack(frames), axis=0).astype(np.float32)
-        shift, r = self.compare(self.ref, new)
-        self.last_result = (shift, r)
-        if shift >= self.MOVE_PX and r >= 0.15:
-            return 'moved'
-        if shift < 3.0 and r >= GAP_SAME_R:
-            self.ref, self.suspect, self.last = new, None, -1e9
-            return 'same'
-        return 'uncertain'
+        fr, _pos = geo_frame_at(path)
+        F = geo_features(fr, self.p)
+        res = geo_compare(self.home, F, self.p) if self.home is not None else None
+        total = self.home_off + res['off'] if res else None
+        if res is None:
+            res, _ = best_anchor(F, self.anchors, self.p)
+            total = res['off'] if res else None
+        v = geo_verdict(res, total)
+        self.last_result = (round(geo_disp(total), 1) if total is not None else 0.0, res['n'] if res else 0)
+        if v == 'same':
+            self.home, self.home_off, self.geo_off = F, total, total
+            self.geo_ok_t, self.geo_sus, self.geo_last = None, None, -1e9
+            self.ref, self.suspect, self.last, self.build = None, None, -1e9, []   # 相位相關基準用新影片重建
+            self.build_t0 = None
+        return v
 
 
 class Detector:
@@ -269,7 +542,9 @@ class Detector:
         self.bg_note = ''       # 初始背景的說明（背景不確定時，這支影片的列車都標需確認）
         self.bg_note_file = None
         self.guard = CameraGuard(profile)   # 攝影機位置基準（和列車背景分開，錄影中斷後也不重建，#75、#76）
-        self.camera_stop = None  # 偵測到攝影機位置改變：dict(t=畫面時間, file=影片, pos=影片內秒數)，判讀就此停止（#71）
+        self.camera_events = []  # 攝影機位置有問題的時間點（#88：不停止判讀，之後的列車標需確認）
+        self.errors = []         # 判讀途中出錯（#87、#88：跳過那支影片剩下的部分，繼續下一支）
+        self.warm = None         # 攝影機突然移動後重新認識背景：暫存這段畫面，背景建好後再補判讀（#88）
         self.small = self.bg_small = self.out_mask = None   # 整個畫面縮小版（估計攝影機自動調亮度）
 
     def feed(self, t_abs: float, gray: np.ndarray, sat: float, file: str, pos: float, frame_bgr=None):
@@ -282,7 +557,10 @@ class Detector:
         gain = self._exposure(frame_bgr)
         if gain != 1.0:
             g = g / gain        # 攝影機自動調亮度（例如亮的列車經過後整個畫面變暗）→ 先還原再比較
-        if self.camera_stop or self._camera_check(t_abs, g, gain, file, pos):
+        if self.warm is not None:
+            self._warm_feed(t_abs, gray, sat, file, pos)
+            return
+        if self._camera_check(t_abs, g, gain, file, pos):
             return
         diff = np.abs(g - self.bg)
         if self.prev is not None and self.prev.shape == g.shape:
@@ -392,24 +670,58 @@ class Detector:
 
     EXPO_SCALE = 8
     def _camera_check(self, t_abs, g, gain, file, pos):
-        """攝影機位置改變（被碰歪、轉動）：交給 CameraGuard 判斷（和列車背景分開，#75～#77）。
-        確認後：進行中的那一筆在改變的那一刻結束（車尾未確認；改變那一刻才開始的，就不是列車），
-        然後**停止這次判讀**（self.camera_stop）：參考線、軌道範圍是固定的像素位置，攝影機動了就不再對準原本的
-        真實位置，不可以重建背景後繼續用（#71）。回傳 True＝已偵測到，process() 會停止"""
+        """攝影機位置有問題（被碰歪、慢慢偏移、轉動、變焦、無法確認、和監測站儲存時不同）：交給 CameraGuard 判斷。
+        v1.0.13 起**不停止判讀**（使用者決定，#88：只有這一份錄影，停下來之後就什麼都沒有了）：
+        記在 camera_events，之後的列車在 process() 最後全部標需確認、附上原因。
+        突然被碰歪（moved）：進行中的那一筆在改變的那一刻結束（車尾未確認；改變那一刻才開始的，就不是列車），
+        然後用接下來 WARM 秒的畫面重新建立列車背景，背景建好後把這段畫面補判讀（不會漏掉這段時間的列車）。
+        回傳 True＝這一格不判讀（開始重新建立背景）"""
         hit = self.guard.check(t_abs, self._frame, self._sat, self.cur is not None, file, pos)
         if not hit:
             return False
-        t0, f0, p0 = hit
+        t0, f0, p0, kind, result = hit
+        g_ = self.guard
+        ce = dict(t=t0, file=f0, pos=p0, kind=kind, result=result, now=t_abs,
+                  disp=round(geo_disp(g_.geo_off), 1) if g_.geo_off is not None else None, n=g_.geo_n)
+        if kind == 'moved' and g_.last_phase:
+            ce['disp'] = round(max(ce['disp'] or 0.0, g_.last_phase[0]), 1)
+        self.camera_events.append(ce)
+        g_.rebase(ce if result == 'uncertain' else None)   # 之後以新的位置為準，再移動一次也抓得到
+        if kind != 'moved':
+            return False                              # 慢慢偏移／無法確認：照常判讀（列車背景會慢慢跟上）
         if self.cur is not None:
             c = self.cur
             if c['end'] > t0:
                 c['end'], c['end_file'], c['end_pos'] = t0, f0, p0
             c['camera_start'] = c['start'] >= t0 - 0.3          # 畫面改變那一刻才開始的：不是列車
             c['camera_t'] = t0
+            c['camera_kind'] = kind
             self.pending_close = None
             self.finish('camera')
-        self.camera_stop = dict(t=t0, file=f0, pos=p0, kind='moved', result='moved')
+        self.warm = dict(until=t_abs + self.WARM, buf=[])
+        ce['warm_until'] = t_abs + self.WARM
         return True
+
+    WARM = 10.0       # 攝影機突然移動後，用幾秒的畫面重新建立列車背景
+
+    def _warm_feed(self, t_abs, gray, sat, file, pos):
+        self.warm['buf'].append((t_abs, gray, sat, file, pos))
+        if t_abs >= self.warm['until']:
+            self.flush_warm()
+
+    def flush_warm(self):
+        """重新建立背景（不滿 WARM 秒就遇到影片結束、錄影中斷、取消時，用已經有的畫面），然後補判讀這段畫面"""
+        w = self.warm
+        if w is None:
+            return
+        self.warm = None
+        if not w['buf']:
+            return
+        step = max(1, len(w['buf']) // 21)
+        bg = np.median(np.stack([x[1].astype(np.float32) for x in w['buf'][::step]]), axis=0).astype(np.float32)
+        self.restart(bg, '', kind='camera')
+        for t, gr, st, fl, ps in w['buf']:            # 補判讀這段畫面（沒有彩色畫面：不估計自動調亮度、不比對攝影機位置）
+            self.feed(t, gr, st, fl, ps, None)
 
     def _exposure(self, frame_bgr):
         """整個畫面（扣掉軌道範圍附近與上方字幕）目前亮度 ÷ 背景亮度的中位數"""
@@ -442,6 +754,7 @@ class Detector:
     def finish(self, why='video_end', note=''):
         """影片全部處理完（video_end）、使用者取消（cancel）或錄影中斷（gap）時收尾。
         這時參考線上還有車（不是已經離開、正在等確認），車尾時間就不是真的車尾離開，標「車尾未確認」（#45、#49）"""
+        self.flush_warm()
         if self.cur is not None:
             # 正在等確認（車尾看起來離開了，但還沒等滿 max(merge_gap, SIDE_WINDOW) 秒，可能只是車廂空隙）
             # 也不算已確認（#66）
@@ -575,24 +888,23 @@ class Detector:
         ev['start_known'] = not c.get('at_file_start')
         if c.get('camera_start'):
             ev['valid'] = False
-            reasons.insert(0, '攝影機位置在 %s 改變（可能被碰到或轉動），這一筆是畫面改變造成的，不是列車；判讀在這裡停止'
+            reasons.insert(0, '攝影機位置在 %s 改變（可能被碰到或轉動），這一筆是畫面改變造成的，不是列車'
                            % fmt_time(c['camera_t']))
         if ev['valid']:
             if not agree:
                 ev['need_check'] = True
                 reasons.append('方向不確定'); items.append('方向不確定')
             wait = max(self.p.merge_gap, self.SIDE_WINDOW)
-            if c.get('confirming') and c.get('incomplete') in ('video_end', 'cancel', 'gap'):
+            if c.get('confirming') and c.get('incomplete') in ('video_end', 'cancel', 'gap', 'error'):
                 ev['need_check'] = True
-                when = {'video_end': '影片就結束了', 'cancel': '就按了取消',
+                when = {'video_end': '影片就結束了', 'cancel': '就按了取消', 'error': '這支影片就讀取出錯了',
                         'gap': '錄影就中斷了%s' % c.get('incomplete_note', '')}[c['incomplete']]
                 reasons.append('車尾未確認：車尾看起來在 %s 離開，但還沒等滿確認時間（%g 秒，用來排除車廂之間的空隙）%s'
                                % (fmt_time(c['end']), wait, when))
                 items.append('車尾離開後確認時間不足（車尾未確認）')
             elif c.get('incomplete') == 'camera':
                 ev['need_check'] = True
-                reasons.append('車尾未確認：攝影機位置在 %s 改變（可能被碰到或轉動），車尾時間無法確認；判讀在這裡停止'
-                               % fmt_time(c['camera_t']))
+                reasons.append('車尾未確認：攝影機位置在 %s 突然改變（可能被碰到），車尾時間無法確認' % fmt_time(c['camera_t']))
                 items.append('攝影機位置改變（車尾未確認）')
             elif c.get('incomplete') == 'video_end':
                 ev['need_check'] = True
@@ -606,6 +918,10 @@ class Detector:
                 ev['need_check'] = True
                 reasons.append('車尾未確認：錄影在 %s 中斷%s，當時列車仍在參考線上' % (fmt_time(c['end']), c.get('incomplete_note', '')))
                 items.append('錄影中斷時列車仍在參考線上（車尾未確認）')
+            elif c.get('incomplete') == 'error':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：影片在 %s 讀取出錯時列車仍在參考線上（%s）' % (fmt_time(c['end']), c.get('incomplete_note', '')))
+                items.append('影片讀取出錯時列車仍在參考線上（車尾未確認）')
             if c.get('static_alarm'):
                 ev['need_check'] = True
                 reasons.append('參考線上曾經超過 %s 完全沒有動靜（可能列車長時間停駛，或攝影機／畫面異常），已計入通過時間，請確認'
@@ -621,11 +937,15 @@ class Detector:
                                % (fmt_time(first_change), shift))
             if max(shift, eshift) > REFINE_CHECK:
                 ev['need_check'] = True
-                items.append('車頭／車尾自動修正超過 %d 秒' % REFINE_CHECK)
+                items.append('車頭／車尾自動修正超過 %g 秒' % REFINE_CHECK)
             if eshift > 0:
                 reasons.append('參考線到 %s 還有微小變化（可能是車尾後光線或背景改變），車尾時間取變化明顯的時刻（往前 %.1f 秒）'
                                % (fmt_time(last_change), eshift))
-            if c.get('at_file_start') == 'gap':
+            if c.get('at_file_start') == 'camera':
+                ev['need_check'] = True
+                reasons.append('攝影機位置改變、重新認識背景時，參考線上已經有變化（車頭時間可能不準）')
+                items.append('攝影機位置改變時已有列車（車頭未確認）')
+            elif c.get('at_file_start') == 'gap':
                 ev['need_check'] = True
                 reasons.append('錄影中斷後，下一支影片一開始就有變化（列車可能在錄影恢復前就已到達，車頭時間是影片開頭）')
                 items.append('錄影中斷後一開始就有列車（車頭未確認）')
@@ -671,8 +991,8 @@ def draw_overlay(frame, profile: Profile, color_ref=(0, 0, 255), color_track=(0,
 def process(files: List[str], bases: List[float], profile: Profile,
             progress: Callable[[float, str], None] = None, cancel: Callable[[], bool] = None, info: dict = None):
     """依序處理多個檔案（同一攝影機）。bases：每個檔案「影片內 0 秒」對應的畫面時間（epoch 秒，由 osd.calibrate 算出）。
-    回傳事件 list（dict）。info（dict）：偵測到攝影機位置改變時填入 info['camera']＝dict(t, file, pos)，
-    判讀在那裡停止，已完成的事件照常回傳（#71）"""
+    回傳事件 list（dict）。info（dict）：攝影機位置有問題時填入 info['camera']（第一次）與 info['camera_events']（全部），
+    影片讀取出錯時填入 info['error']／info['errors']；都**繼續判讀**，之後的列車標需確認（#88）"""
     det = None
     durs = []
     for f in files:
@@ -681,87 +1001,148 @@ def process(files: List[str], bases: List[float], profile: Profile,
     total = sum(durs) or 1
     done = 0.0
     prev_end = None                       # 上一支影片最後一格的畫面時間（實際讀到的，不用檔頭的長度）
+    batch_t0 = None
+    errors = []
     for fi, (f, base) in enumerate(zip(files, bases)):
-        cap = cv2.VideoCapture(f)
-        if not cap.isOpened():
-            raise RuntimeError('無法開啟影片：' + os.path.basename(f))
-        W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-        crop = work_crop(profile, W, H)
-        if det is None:
-            det = Detector(profile, crop)
-            batch_t0 = base
-            det.bg, det.bg_note = initial_background(f, crop, profile)   # 開頭若剛好有列車經過，不會被當成背景
-            det.bg_note_file = f
-        elif prev_end is not None and base < prev_end - OVERLAP_SEC:
-            # 實際讀完上一支後，下一支的時間比它還早：時間倒退或重疊，不可以把時間往回餵給判讀（#69）
-            raise TimeOrderError('依實際影片時間確認，「%s」的開始時間 %s 比上一支「%s」實際的結尾 %s 還早 %.1f 秒'
-                                 '（時間重疊或倒退）。請檢查影片是否重複加入、順序或畫面時間是否正確。'
-                                 % (os.path.basename(f), fmt_time(base), os.path.basename(files[fi - 1]),
-                                    fmt_time(prev_end), prev_end - base))
-        elif prev_end is not None and base - prev_end > GAP_SEC:
-            # 錄影中斷（缺檔）：前後不是連續畫面。進行中的那一筆在中斷處結束（車尾未確認），背景重新建立（#49）
-            gap = base - prev_end
-            det.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
-            # 攝影機位置：中斷前後要確認一致才可以繼續用原本的參考線（#76）
-            res = det.guard.gap_check(f)
-            if res != 'same':
-                cap.release()
-                if info is not None:
-                    shift, r = det.guard.last_result or (0.0, 0.0)
-                    info['camera'] = dict(t=base, file=f, pos=0.0, kind='gap', result=res, prev_end=prev_end,
-                                          shift=round(shift, 1), r=round(r, 2))
-                if info is not None and det.guard.notes:
-                    info['notes'] = list(det.guard.notes)
-                return det.events
-            bg, note = initial_background(f, crop, profile)
-            det.restart(bg, note)
-            det.bg_note_file = f
-        k = 0
+        cap = None
         last_pos = 0.0
-        sat = 50.0
-        while True:
-            ok, fr = cap.read()
-            if not ok:
-                break
-            pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
-            if pos <= last_pos and k > 0:   # 少數格式讀不到時間 → 用上一格推算
-                pos = last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15)
-            last_pos = pos
-            x0, y0, x1, y1 = crop
-            sub = fr[y0:y1, x0:x1]
-            gray = cv2.GaussianBlur(cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY), (5, 5), 0)
-            if k % 15 == 0:
-                sat = float(cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
-            det.feed(base + pos, gray, sat, f, pos, fr)
-            k += 1
-            if det.camera_stop:                    # 攝影機位置改變：停止判讀（#71）
+        try:
+            cap = cv2.VideoCapture(f)
+            if not cap.isOpened():
+                raise RuntimeError('無法開啟影片')
+            W = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); H = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+            crop = work_crop(profile, W, H)
+            if det is None:
+                det = Detector(profile, crop)
+                batch_t0 = base
+                det.bg, det.bg_note = initial_background(f, crop, profile)   # 開頭若剛好有列車經過，不會被當成背景
+                det.bg_note_file = f
+            elif prev_end is not None and base < prev_end - OVERLAP_SEC:
+                # 實際讀完上一支後，下一支的時間比它還早：時間倒退或重疊，不可以把時間往回餵給判讀（#69）
+                raise TimeOrderError('依實際影片時間確認，「%s」的開始時間 %s 比上一支「%s」實際的結尾 %s 還早 %.1f 秒'
+                                     '（時間重疊或倒退）。請檢查影片是否重複加入、順序或畫面時間是否正確。'
+                                     % (os.path.basename(f), fmt_time(base), os.path.basename(files[fi - 1]),
+                                        fmt_time(prev_end), prev_end - base))
+            elif prev_end is not None and base - prev_end > GAP_SEC:
+                # 錄影中斷（缺檔）：前後不是連續畫面。進行中的那一筆在中斷處結束（車尾未確認），背景重新建立（#49）
+                gap = base - prev_end
+                det.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
+                # 攝影機位置：中斷前後確認一致才算沒問題；不一致或無法確認 → 記下來、繼續判讀，之後的列車標需確認（#76、#88）
+                res = det.guard.gap_check(f)
+                if res != 'same':
+                    disp, n = det.guard.last_result or (0.0, 0)
+                    ce = dict(t=base, file=f, pos=0.0, kind='gap', result=res, prev_end=prev_end, disp=disp, n=n, now=base)
+                    det.camera_events.append(ce)
+                    det.guard.rebase(ce if res == 'uncertain' else None)
+                bg, note = initial_background(f, crop, profile)
+                det.restart(bg, note)
+                det.bg_note_file = f
+            k = 0
+            sat = 50.0
+            while True:
+                ok, fr = cap.read()
+                if not ok:
+                    break
+                pos = cap.get(cv2.CAP_PROP_POS_MSEC) / 1000.0
+                if pos <= last_pos and k > 0:   # 少數格式讀不到時間 → 用上一格推算
+                    pos = last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15)
+                last_pos = pos
+                x0, y0, x1, y1 = crop
+                sub = fr[y0:y1, x0:x1]
+                gray = cv2.GaussianBlur(cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY), (5, 5), 0)
+                if k % 15 == 0:
+                    sat = float(cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+                det.feed(base + pos, gray, sat, f, pos, fr)
+                k += 1
+                if progress and k % 150 == 0:
+                    progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
+                if cancel and k % 30 == 0 and cancel():
+                    cap.release()
+                    return _wrap_up(det, det.finish('cancel'), batch_t0, info, errors)
+            prev_end = base + last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15) if k else base
+        except TimeOrderError:
+            raise
+        except Exception as ex:
+            # 判讀途中出錯（例如影片損壞）：跳過這支影片剩下的部分，繼續下一支；已完成的列車照常輸出（#87、#88）
+            errors.append(dict(file=f, t=base + last_pos, pos=last_pos, msg='%s: %s' % (type(ex).__name__, ex)))
+            if det is not None:
+                try:
+                    det.finish('error', '%s，影片 %s' % (type(ex).__name__, os.path.basename(f)))
+                except Exception:
+                    pass
+                prev_end = base + last_pos       # 下一支影片會當成錄影中斷（背景重建、位置重新比對）
+        finally:
+            if cap is not None:
                 cap.release()
-                evs = det.finish('camera')
-                _mark_initial_window(evs, det, batch_t0)
-                if info is not None:
-                    info['camera'] = dict(det.camera_stop)
-                    if det.guard.notes:
-                        info['notes'] = list(det.guard.notes)
-                return evs
-            if progress and k % 150 == 0:
-                progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
-            if cancel and k % 30 == 0 and cancel():
-                cap.release()
-                return det.finish('cancel')
-        prev_end = base + last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15) if k else base
-        cap.release()
         done += durs[fi]
-    if det and info is not None and det.guard.notes:
-        info['notes'] = list(det.guard.notes)
-    return det.finish('video_end') if det else []
+    if det is None:
+        if errors:
+            raise RuntimeError('沒有任何一支影片可以判讀：%s（%s）' % (os.path.basename(errors[0]['file']), errors[0]['msg']))
+        return []
+    return _wrap_up(det, det.finish('video_end'), batch_t0, info, errors)
 
 
-def _mark_initial_window(evs, det, batch_t0, window=90.0):
+def _wrap_up(det, evs, batch_t0, info, errors):
+    """判讀結束：攝影機位置有問題之後的列車標需確認（#88），結果寫進 info"""
+    ces = det.camera_events
+    if ces:
+        first_moved = next((c for c in ces if c['kind'] == 'moved'), None)
+        if first_moved is not None:
+            _mark_initial_window(evs, first_moved['t'], batch_t0)
+        _mark_after_camera(evs, ces)
+    if info is not None:
+        if ces:
+            info['camera'] = dict(ces[0])
+            info['camera_events'] = [dict(c) for c in ces]
+        if errors:
+            info['error'] = dict(errors[0])
+            info['errors'] = [dict(x) for x in errors]
+        if det.guard.notes:
+            info['notes'] = list(det.guard.notes)
+    return evs
+
+
+CAMERA_WHY = {'moved': '攝影機位置在 %s 突然改變（可能被碰到）',
+              'drift': '攝影機位置在 %s 前後慢慢偏移（或轉動、變焦）',
+              'uncertain': '%s 起有一段時間無法確認攝影機位置',
+              'profile': '判讀開始時（%s）攝影機位置和監測站儲存時不同',
+              'gap': '錄影中斷後（%s）的畫面位置和中斷前不同'}
+
+
+def camera_reason(c, with_disp=True):
+    """攝影機位置有問題的一句話說明（事件備註用）"""
+    if c['kind'] == 'profile' and c.get('result') != 'moved':
+        why = '判讀開始時（%s）無法確認攝影機位置和監測站儲存時相同' % fmt_time(c['t'])
+    elif c['kind'] == 'gap' and c.get('result') != 'moved':
+        why = '錄影中斷後（%s）無法確認畫面位置和中斷前相同' % fmt_time(c['t'])
+    else:
+        why = CAMERA_WHY.get(c['kind'], '攝影機位置在 %s 改變') % fmt_time(c['t'])
+    if with_disp and c.get('disp') and c.get('result') == 'moved':
+        why += '（參考線一帶偏了約 %s 像素）' % c['disp']
+    return why
+
+
+def _mark_after_camera(evs, ces):
+    """攝影機位置有問題之後（含當時正在通過）的列車：標需確認，附上原因（#88）"""
+    for e in evs:
+        if not e.get('valid'):
+            continue
+        rel = [c for c in ces if e['end'] >= c['t'] and (c.get('until') is None or e['start'] <= c['until'])]
+        if not rel:
+            continue
+        c = max((x for x in rel if x['t'] <= e['start']), key=lambda x: x['t'], default=rel[0])
+        e['need_check'] = True
+        e['reason'] = (e.get('reason', '') + '；' + camera_reason(c) + '，參考線可能對不準，時間請確認').strip('；')
+        e.setdefault('check_items', [])
+        if '攝影機位置有問題之後的列車' not in e['check_items']:
+            e['check_items'].append('攝影機位置有問題之後的列車')
+
+
+def _mark_initial_window(evs, t0, batch_t0, window=90.0):
     """攝影機在批次開頭 window 秒內移動：初始列車背景（開頭 90 秒中位數）混到了移動後的畫面，
     這段時間的判讀不可靠（#75）。從批次一開始就有、一直到攝影機改變才結束的那一筆＝背景錯位造成的，不是列車；
     其他在改變前開始的標需確認"""
-    t0 = det.camera_stop['t']
-    if t0 - batch_t0 > window:
+    if batch_t0 is None or t0 - batch_t0 > window:
         return
     for e in evs:
         if e['start'] >= t0 or not e.get('valid'):
@@ -777,7 +1158,6 @@ def _mark_initial_window(evs, det, batch_t0, window=90.0):
             e.setdefault('check_items', []).append('攝影機在開頭移動（時間可能不準）')
 
 
-GAP_SAME_R = 0.3   # 錄影中斷前後比對：r 至少這麼高（而且平移 < 3 像素）才算確認位置一致
 GAP_SEC = 5.0       # 前一支影片結束到下一支開始超過幾秒，就當成錄影中斷（和開始判讀前的「缺檔」檢查一致）
 OVERLAP_SEC = 2.0   # 下一支影片比上一支實際結尾早超過幾秒，就是時間重疊／倒退（和開始判讀前的「重疊」檢查一致）
 
@@ -822,7 +1202,8 @@ def initial_background(path, crop, profile: Profile = None, n=31, seconds=90.0):
     return head, ''
 
 
-REFINE_CHECK = 5.0   # 車頭／車尾自動修正（_refine）超過幾秒就標需確認。使用者可接受的誤差是 5 秒（#57；實際樣本最大 4.1 秒）
+REFINE_CHECK = 1.5   # 車頭／車尾自動修正（_refine）超過幾秒就標需確認。使用者可接受的誤差：車頭進入、車尾離開參考線
+                     # 1.5 秒以內（使用者 2026-10-03 確認，#86；原本 5 秒）。13 支樣本：最大 4.1 秒（夜間車燈）
 BG_UNSURE = '這支影片開頭的畫面和整支影片不一樣（可能有列車在影片開頭停著、或停了很久），背景不確定，列車時間可能不準'
 
 

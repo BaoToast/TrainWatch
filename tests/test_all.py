@@ -484,7 +484,7 @@ class TestRound3(unittest.TestCase):
 
 
 class TestRound4(unittest.TestCase):
-    """v1.0.11：攝影機位置改變 → 停止判讀（修正清單 #71）"""
+    """v1.0.11：攝影機位置改變（修正清單 #71）。v1.0.13 起改成繼續判讀，之後的列車標需確認（#88）"""
     scene = TestRound2.scene
     valid = TestRound2.valid
 
@@ -494,26 +494,34 @@ class TestRound4(unittest.TestCase):
         return evs, info
 
     def test71a_idle_camera_moved_stops(self):
-        """#71 沒有列車時攝影機被碰歪 → 偵測到、停止判讀，之後的列車不再分析；回報影片與時間"""
+        """#71／#88 沒有列車時攝影機被碰歪 → 偵測到、回報影片與時間；**繼續判讀**，之後的列車判讀得到、標需確認並寫原因"""
         d, f, exp = self.scene('a.avi', 240, trains=[dict(t0=200, d=1)], camera_shift=(120, 14, 9, 1.5), texture=3000)
         evs, info = self.run_info([f], [0.0])
         self.assertIn('camera', info, info)
         self.assertEqual(info['camera']['file'], f)
         self.assertLess(abs(info['camera']['t'] - 120), 1.0, info)
-        self.assertEqual([e for e in self.valid(evs) if e['start'] > 121], [], [(e['start'], e['reason']) for e in evs])
+        after = [e for e in self.valid(evs) if e['start'] > 121]
+        self.assertEqual(len(after), 1, [(e['start'], e['valid'], e['reason'][:60]) for e in evs])
+        self.assertLess(abs(after[0]['start'] - 200), 0.5)
+        self.assertTrue(after[0]['need_check'])
+        self.assertIn('攝影機位置', after[0]['reason'])
+        self.assertEqual([e for e in self.valid(evs) if 115 < e['start'] < 135], [], '攝影機移動那一刻不可以多出一筆列車')
 
     def test71b_camera_moved_during_train_stops(self):
-        """#71 列車通過途中攝影機被碰歪 → 那一筆保留、車尾未確認、需確認；停止判讀，之後的列車不再分析"""
+        """#71／#88 列車通過途中攝影機被碰歪 → 那一筆保留、車尾未確認、需確認；繼續判讀，之後的列車判讀得到、標需確認"""
         d, f, exp = self.scene('a.avi', 260, trains=[dict(t0=150, d=1, speed=40), dict(t0=220, d=-1)],
                                camera_shift=(151, 14, 9, 1.5), texture=3000)
         evs, info = self.run_info([f], [0.0])
         v = self.valid(evs)
         info2 = [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason'][:50]) for e in evs]
         self.assertIn('camera', info, info2)
-        self.assertEqual(len(v), 1, info2)
+        self.assertEqual(len(v), 2, info2)
         self.assertLess(abs(v[0]['start'] - 150), 0.5)
         self.assertFalse(v[0]['end_known']); self.assertTrue(v[0]['need_check'])
         self.assertIn('攝影機位置', v[0]['reason'])
+        self.assertLess(abs(v[1]['start'] - 220), 0.5, info2)
+        self.assertTrue(v[1]['need_check'])
+        self.assertIn('攝影機位置', v[1]['reason'])
 
     def test71c_no_false_camera_stop(self):
         """#71 曝光變化、車燈、紅外線切換、陽光、一般列車 → 不可以誤判成攝影機移動"""
@@ -537,11 +545,15 @@ class TestRound5(unittest.TestCase):
     run_info = TestRound4.run_info
 
     def test75a_move_at_30s_inside_initial_window(self):
-        """#75 第 30 秒攝影機永久移動（還在開頭 90 秒的背景取樣區間內）→ 一定要偵測到並停止"""
+        """#75 第 30 秒攝影機永久移動（還在開頭 90 秒的背景取樣區間內）→ 一定要偵測到；之後的列車判讀得到、標需確認（#88）"""
         d, f, exp = self.scene('a.avi', 150, trains=[dict(t0=120, d=1)], camera_shift=(30, 14, 9, 1.5), texture=3000)
         evs, info = self.run_info([f], [0.0])
         self.assertIn('camera', info, [(e['start'], e['end'], e['valid'], e['reason'][:40]) for e in evs])
         self.assertLess(abs(info['camera']['t'] - 30), 1.5, info)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1, [(e['start'], e['end'], e['valid'], e['reason'][:60]) for e in evs])
+        self.assertLess(abs(v[0]['start'] - 120), 0.5)
+        self.assertTrue(v[0]['need_check'])
 
     def test75b_move_at_3s(self):
         """#75 第 3 秒攝影機永久移動 → 偵測到；移動以前那幾秒不可以變成一列「列車」"""
@@ -571,22 +583,25 @@ class TestRound5(unittest.TestCase):
         self.assertEqual(len(self.valid(evs)), 1)
 
     def test76e_gap_camera_moved(self):
-        """#76 錄影中斷期間攝影機被移動 → 停止判讀，回報影片、時間，並說明中斷前後位置不一致"""
+        """#76 錄影中斷期間攝影機被移動 → 回報影片、時間，說明中斷前後位置不一致；繼續判讀，之後的列車標需確認（#88）"""
         evs, info, b = self.gap_case(dict(camera_shift=(0, 14, 9, 1.5)))
         self.assertIn('camera', info, info)
         self.assertEqual(info['camera']['file'], b)
         self.assertEqual(info['camera'].get('kind'), 'gap')
-        self.assertEqual(self.valid(evs), [])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]['need_check'])
+        self.assertIn('錄影中斷後', v[0]['reason'])
 
     def test76f_gap_day_to_ir(self):
-        """#76 中斷前白天、中斷後紅外線，攝影機沒動 → 能確認位置一致就繼續；確認不了就停止並說明「無法確認」，
-        不可以默默當成位置一定沒變"""
+        """#76 中斷前白天、中斷後紅外線，攝影機沒動 → 能確認位置一致就照常；確認不了就說明「無法確認」、之後的列車標需確認，
+        不可以默默當成位置一定沒變。列車都要判讀得到（#88）"""
         evs, info, b = self.gap_case(dict(ir_at=0))
+        self.assertEqual(len(self.valid(evs)), 1)
         if 'camera' in info:
             self.assertEqual(info['camera'].get('kind'), 'gap')
             self.assertIn(info['camera'].get('result'), ('uncertain', 'moved'))
-        else:
-            self.assertEqual(len(self.valid(evs)), 1)
+            self.assertTrue(self.valid(evs)[0]['need_check'])
 
 
 class TestRound6(unittest.TestCase):
@@ -638,21 +653,29 @@ class TestRound7(unittest.TestCase):
             self.skipTest(str(e))
         return gui
 
-    def test80a_stop_text_kinds(self):
+    def test80a_event_text_kinds(self):
+        """#80／#88 攝影機位置有問題的說明：各種情形說法不同，都寫影片、時間，並說明之後的列車標需確認"""
         gui = self._gui()
         t0 = dt.datetime(2030, 1, 1, 8, 0, 0).timestamp()
-        mv = gui.camera_stop_text(dict(t=t0, file='x/a.mkv', pos=12.0, kind='moved'))
-        gm = gui.camera_stop_text(dict(t=t0, file='x/b.mkv', pos=0.0, kind='gap', result='moved', prev_end=t0 - 60))
-        gu = gui.camera_stop_text(dict(t=t0, file='x/b.mkv', pos=0.0, kind='gap', result='uncertain', prev_end=t0 - 60))
-        self.assertEqual(len({mv, gm, gu}), 3)
-        self.assertIn('位置／角度改變', mv)
-        self.assertIn('明顯不同', gm)
-        self.assertIn('無法確認', gu)
-        for x in (gm, gu):
-            self.assertIn('b.mkv', x)
-            self.assertIn('07:59:00', x)          # 中斷前最後畫面時間
-            self.assertIn('判讀在這裡停止', x)
-        self.assertIn('a.mkv', mv)
+        ks = [dict(t=t0, file='x/a.mkv', pos=12.0, kind='moved', result='moved', disp=8.0, now=t0, warm_until=t0 + 10),
+              dict(t=t0, file='x/b.mkv', pos=0.0, kind='gap', result='moved', prev_end=t0 - 60, disp=9.0),
+              dict(t=t0, file='x/b.mkv', pos=0.0, kind='gap', result='uncertain', prev_end=t0 - 60),
+              dict(t=t0, file='x/a.mkv', pos=30.0, kind='drift', result='moved', disp=6.5),
+              dict(t=t0, file='x/a.mkv', pos=30.0, kind='uncertain', result='uncertain'),
+              dict(t=t0, file='x/a.mkv', pos=0.0, kind='profile', result='moved', disp=12.0)]
+        txt = [gui.camera_event_text(k) for k in ks]
+        self.assertEqual(len(set(txt)), len(txt))
+        for x, k in zip(txt, ks):
+            self.assertIn(os.path.basename(k['file']), x)
+            self.assertIn('08:00:00', x)
+            self.assertIn('標需人工確認', x)
+        self.assertIn('07:59:00', txt[1])          # 中斷前最後畫面時間
+        self.assertIn('補判讀', txt[0])
+        self.assertIn('8.0', txt[0])
+        q = gui.quality_summary([], timing=[dict(warn=txt[0])])
+        self.assertIn('已繼續判讀', q)
+        self.assertIn('重畫參考線', q)
+        self.assertIn('逐筆確認', q)
 
     def test80b_notes_shown(self):
         gui = self._gui()
@@ -662,7 +685,7 @@ class TestRound7(unittest.TestCase):
         gui.apply_camera_info(info, files, timing)
         self.assertNotIn('cam_note', timing[0])
         self.assertIn('紅外線', timing[1]['cam_note'])
-        self.assertNotIn('stop', timing[1])
+        self.assertNotIn('warn', timing[1])
         q = gui.quality_summary([], timing=timing)
         self.assertIn('位置基準重新建立', q)
         self.assertIn('08:11:40', q)
@@ -673,9 +696,197 @@ class TestRound7(unittest.TestCase):
         ws = openpyxl.load_workbook(p)['設定與影片']
         cells = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
         self.assertTrue(any('08:11:40' in c for c in cells), cells)
-        info = dict(camera=dict(t=1e9, file='x/a.mkv', pos=3.0, kind='moved'))
+        info = dict(camera_events=[dict(t=1e9, file='x/a.mkv', pos=3.0, kind='moved', result='moved', now=1e9)])
         gui.apply_camera_info(info, files, timing)
-        self.assertIn('判讀在這裡停止', timing[0]['stop'])
+        self.assertIn('之後的列車', timing[0]['warn'])
+        export.write_excel(p, [], core.Profile(), files, timing)
+        ws = openpyxl.load_workbook(p)['設定與影片']
+        cells = [str(c.value) for row in ws.iter_rows() for c in row if c.value]
+        self.assertTrue(any('判讀途中的狀況' in c for c in cells), cells)
+
+
+class TestRound8(unittest.TestCase):
+    """v1.0.13：監測站的攝影機位置基準（#82）、慢慢偏移（#83）、無法確認時停止（#84）、錄影中斷沒有基準（#85）、
+    可接受誤差 1.5 秒（#86）"""
+    scene = TestRound2.scene
+    valid = TestRound2.valid
+    run_info = TestRound4.run_info
+
+    def anchored(self, f, at=1.0):
+        """用 f 第 at 秒的畫面建立位置基準（等於在這個畫面畫好參考線、儲存監測站）"""
+        import cv2
+        c = cv2.VideoCapture(f)
+        c.set(cv2.CAP_PROP_POS_MSEC, at * 1000)
+        ok, fr = c.read()
+        c.release()
+        p = core.Profile()
+        p.camera_anchors = [core.make_anchor(fr)]
+        return p
+
+    def test82a_profile_anchor_same_place(self):
+        """#82 監測站在位置 A 存基準；下一批影片也是位置 A → 照常判讀"""
+        d, a, _ = self.scene('a.avi', 20, texture=3000)
+        d, b, _ = self.scene('b.avi', 40, trains=[dict(t0=20, d=1)], texture=3000, seed=2)
+        evs, info = self.run_info([b], [0.0], self.anchored(a))
+        self.assertNotIn('camera', info, info)
+        self.assertEqual(len(self.valid(evs)), 1)
+
+    def test82b_moved_before_batch(self):
+        """#82 監測站在位置 A 存基準；下一批影片從第一格起就移動 14×9＋轉 1.5 度 → 判讀開始時就發現（kind=profile）；
+        使用者選「仍要判讀」時（#88）照常判讀，全部列車標需確認並寫原因"""
+        d, a, _ = self.scene('a.avi', 20, texture=3000)
+        d, b, _ = self.scene('b.avi', 40, trains=[dict(t0=20, d=1)], texture=3000, camera_shift=(0, 14, 9, 1.5))
+        p = self.anchored(a)
+        self.assertEqual([x['verdict'] for x in core.check_start([b], p)], ['moved'])     # 畫面會先問使用者
+        evs, info = self.run_info([b], [0.0], p)
+        self.assertIn('camera', info, info)
+        self.assertEqual(info['camera'].get('kind'), 'profile')
+        self.assertEqual(info['camera'].get('result'), 'moved')
+        self.assertLess(info['camera']['t'], 1.0)
+        v = self.valid(evs)
+        self.assertEqual(len(v), 1)
+        self.assertTrue(v[0]['need_check'])
+        self.assertIn('監測站儲存時不同', v[0]['reason'])
+
+    def test82c_anchor_brightness(self):
+        """#82 隔天亮度差很多、攝影機沒動 → 位置相同；確認不了也只能是「無法確認」，不可以判成移動"""
+        d, a, _ = self.scene('a.avi', 20, texture=3000)
+        d, b, _ = self.scene('b.avi', 30, texture=3000, exposure=[(0, 30, 0.6)])
+        evs, info = self.run_info([b], [0.0], self.anchored(a))
+        if 'camera' in info:
+            self.assertEqual(info['camera'].get('result'), 'uncertain', info)
+
+    def test82d_check_start(self):
+        """#82 判讀前檢查：沒有基準（舊版監測站）→ 要使用者確認；基準位置不同 → moved；
+        批次中途畫面變成紅外線 → 紅外線那段也要檢查"""
+        d, a, _ = self.scene('a.avi', 10, texture=3000)
+        d, m, _ = self.scene('m.avi', 10, texture=3000, camera_shift=(0, 14, 9, 1.5))
+        d, n, _ = self.scene('n.avi', 10, texture=3000, ir_at=0)
+        r = core.check_start([a], core.Profile())
+        self.assertEqual([x['verdict'] for x in r], ['none'])
+        p = self.anchored(a)
+        self.assertEqual([x['verdict'] for x in core.check_start([a], p)], ['same'])
+        self.assertEqual([x['verdict'] for x in core.check_start([m], p)], ['moved'])
+        r = core.check_start([a, n], p)
+        self.assertEqual([x['file'] for x in r], [a, n])
+        self.assertEqual(r[0]['verdict'], 'same')
+        self.assertIn(r[1]['verdict'], ('same', 'uncertain'))
+
+    def test83a_slow_drift(self):
+        """#83 攝影機從第 5 秒起每 2 秒偏 0.6 像素（每次都小於基準更新門檻 1 像素）→ 累積超過 6 像素後要偵測到"""
+        d, f, _ = self.scene('a.avi', 120, texture=3000, cam_path=[(0, 0, 0), (5, 0, 0), (95, 27, 0)])
+        evs, info = self.run_info([f], [0.0])
+        self.assertIn('camera', info, info)
+        self.assertEqual(info['camera'].get('kind'), 'drift', info)
+        self.assertLess(info['camera']['t'], 100, info)
+
+    def test83b_jitter_no_false_alarm(self):
+        """#83 攝影機每 2 秒隨機晃 ±0.5 像素、長期平均在原位 → 不可以誤判"""
+        rng = np.random.default_rng(5)
+        path = [(t, float(rng.uniform(-0.5, 0.5)), float(rng.uniform(-0.5, 0.5))) for t in range(0, 151, 2)]
+        d, f, _ = self.scene('a.avi', 150, texture=3000, cam_path=path)
+        evs, info = self.run_info([f], [0.0])
+        self.assertNotIn('camera', info, info)
+
+    def test83c_drift_and_back(self):
+        """#83 先慢慢偏 4 像素、再慢慢回到原位 → 不可以因為「總共移動了 8 像素」就誤判"""
+        d, f, _ = self.scene('a.avi', 150, texture=3000, cam_path=[(0, 0, 0), (40, 4, 0), (80, 0, 0)])
+        evs, info = self.run_info([f], [0.0])
+        self.assertNotIn('camera', info, info)
+
+    def test84a_rotation(self):
+        """#84 純轉動 4 度（平移幾乎是 0）→ 軌道範圍兩端偏移超過 6 像素，要偵測到"""
+        d, f, _ = self.scene('a.avi', 90, texture=3000, camera_shift=(20, 0, 0, 4.0))
+        evs, info = self.run_info([f], [0.0])
+        self.assertIn('camera', info, info)
+
+    def test84b_zoom(self):
+        """#84 變焦 5%（平移是 0）→ 軌道範圍兩端偏移超過 6 像素，要偵測到"""
+        d, f, _ = self.scene('a.avi', 90, texture=3000, cam_path=[(0, 0, 0), (20, 0, 0, 0, 1.0), (20.1, 0, 0, 0, 1.05)])
+        evs, info = self.run_info([f], [0.0])
+        self.assertIn('camera', info, info)
+
+    def test84c_ir_switch_no_stop(self):
+        """#84 攝影機沒動、第 20 秒切換紅外線 → 不可以因為切換就當成位置有問題"""
+        d, f, _ = self.scene('a.avi', 150, texture=3000, ir_at=20, trains=[dict(t0=120, d=1)])
+        evs, info = self.run_info([f], [0.0])
+        self.assertNotIn('camera', info, info)
+        self.assertEqual(len(self.valid(evs)), 1)
+
+    def test84d_uncertain_then_recovered(self):
+        """#88 畫面有一段時間比不起來（例如傍晚轉換、大雨），之後又和監測站基準確認位置相同 →
+        只有比不起來那段時間的列車標需確認，之後的列車照常（不是從此全部標需確認）"""
+        import cv2
+        d = _mkdtemp()
+        src, f = os.path.join(d, 's.avi'), os.path.join(d, 'f.avi')
+        selftest.make_scene(src, 150, trains=[dict(t0=120, d=1)], texture=3000)
+        c = cv2.VideoCapture(src)
+        w = cv2.VideoWriter(f, cv2.VideoWriter_fourcc(*'MJPG'), selftest.FPS, (selftest.W, selftest.H))
+        rng = np.random.default_rng(1)
+        i = 0
+        while True:
+            ok, fr = c.read()
+            if not ok:
+                break
+            if 20 * selftest.FPS <= i < 60 * selftest.FPS:       # 這 40 秒畫面完全比不起來
+                fr = rng.integers(0, 255, fr.shape, np.uint8)
+            w.write(fr); i += 1
+        w.release(); c.release()
+        old = core.GEO_STALE
+        core.GEO_STALE = 10.0
+        try:
+            evs, info = self.run_info([f], [0.0], self.anchored(src))
+        finally:
+            core.GEO_STALE = old
+        ces = info.get('camera_events', [])
+        self.assertTrue(any(x['kind'] == 'uncertain' and x.get('until') for x in ces), ces)
+        v = [e for e in self.valid(evs) if abs(e['start'] - 120) < 1]
+        self.assertEqual(len(v), 1, [(e['start'], e['valid'], e['reason'][:50]) for e in evs])
+        self.assertNotIn('攝影機', v[0]['reason'])
+
+    def test85_gap_without_reference(self):
+        """#85 還沒有位置基準就遇到錄影中斷 → 不可以回答「相同」"""
+        d, f, _ = self.scene('a.avi', 5, texture=3000)
+        g = core.CameraGuard(core.Profile())
+        self.assertEqual(g.gap_check(f), 'uncertain')
+
+    def test87_error_keeps_results(self):
+        """#87／#88 第二支影片判讀途中出錯 → 第一支的列車照常回傳；跳過第二支剩下的部分、**繼續判讀第三支**；
+        回報在哪一支、哪個時間出錯"""
+        d = _mkdtemp()
+        a, b, c = (os.path.join(d, x) for x in ('a.avi', 'b.avi', 'c.avi'))
+        for x in (a, b, c):
+            selftest.make_scene(x, 30, trains=[dict(t0=10, d=1)])
+        orig = core.Detector.feed
+
+        def boom(self, t_abs, *a_, **k):
+            if 35 <= t_abs < 60:
+                raise ValueError('模擬解碼錯誤')
+            return orig(self, t_abs, *a_, **k)
+        core.Detector.feed = boom
+        try:
+            info = {}
+            evs = core.process([a, b, c], [0.0, 30.0, 60.0], core.Profile(), info=info)
+        finally:
+            core.Detector.feed = orig
+        v = [e for e in evs if e['valid']]
+        self.assertEqual([round(e['start']) for e in v], [10, 70], [(e['start'], e['reason'][:50]) for e in evs])
+        self.assertEqual(info['error']['file'], b)
+        self.assertIn('模擬解碼錯誤', info['error']['msg'])
+        try:
+            from trainwatch import gui
+        except Exception:
+            return
+        timing = [dict(offset=0), dict(offset=30), dict(offset=60)]
+        gui.apply_camera_info(info, [a, b, c], timing)
+        self.assertIn('讀取出錯', timing[1]['warn'])
+        self.assertIn('從下一支繼續', timing[1]['warn'])
+
+    def test86_time_tolerance(self):
+        """#86 使用者可接受的誤差：車頭進入、車尾離開參考線 1.5 秒以內 → 自動修正超過 1.5 秒要標需確認"""
+        self.assertEqual(core.REFINE_CHECK, 1.5)
+        import inspect
+        self.assertNotIn('可接受誤差是 5 秒', inspect.getsource(core))
 
 
 class TestRound2Gui(unittest.TestCase):
@@ -927,6 +1138,39 @@ class TestSamples(unittest.TestCase):
                 self.assertIn('camera', info, (key, dx, dy, ang))
                 self.assertLess(abs(info['camera']['t'] - 60), 2.0, (key, info))
 
+    def test82_real_profile_anchor(self):
+        """#82 真實樣本：用前一支影片第 1 秒存位置基準（等於當時畫好參考線、儲存監測站），
+        下一支（白天、夜間各一組）的前 120 秒 → 位置相同、不可以有警告；同一段畫面整個移動 14×9＋轉 1.5 度 → 判讀開始時就發現
+        （kind=profile），之後的列車都標需確認"""
+        import cv2
+        root = os.environ['TW_SAMPLES']
+        allf = sorted(glob.glob(os.path.join(root, '*.mkv')))
+        for a, b in ((allf[0], allf[1]), (allf[-2], allf[-1])):     # 不寫檔名（檔名就是真實時間）
+            p = core.Profile()
+            fr, _ = core.geo_frame_at(a)
+            p.camera_anchors = [core.make_anchor(fr)]
+            for move in (False, True):
+                d = _mkdtemp(); f = os.path.join(d, 'm.avi')
+                c = cv2.VideoCapture(b)
+                w = cv2.VideoWriter(f, cv2.VideoWriter_fourcc(*'MJPG'), 15.0, (640, 360))
+                for _ in range(15 * 120):
+                    ok, x = c.read()
+                    if not ok:
+                        break
+                    if move:
+                        M = cv2.getRotationMatrix2D((320, 180), 1.5, 1.0); M[0, 2] += 14; M[1, 2] += 9
+                        x = cv2.warpAffine(x, M, (640, 360), borderMode=cv2.BORDER_REFLECT)
+                    w.write(x)
+                w.release(); c.release()
+                info = {}
+                evs = core.process([f], [0.0], p, info=info)
+                if move:
+                    self.assertEqual(info.get('camera', {}).get('kind'), 'profile', info)
+                    self.assertEqual(info['camera'].get('result'), 'moved', info)
+                    self.assertTrue(all(e['need_check'] for e in evs if e['valid']))
+                else:
+                    self.assertNotIn('camera', info, info)
+
     def test_shots_and_clips_every_sample(self):
         """每支樣本影片（含每秒實際格數和檔頭不符的）：每一筆都要有 3 張截圖；列車要有短片，已排除的不產生短片（#60），
         而且車頭截圖上的畫面時間要和判讀的車頭時間一致（差 1 秒內）"""
@@ -974,6 +1218,10 @@ SLOW_TESTS = {
     'TestRound5': ['test75a_move_at_30s_inside_initial_window', 'test75b_move_at_3s', 'test75c_train_at_start_no_move',
                    'test76d_gap_same_place_brightness', 'test76e_gap_camera_moved', 'test76f_gap_day_to_ir'],
     'TestRound6': ['test79a_crossing_a_longer', 'test79b_crossing_b_leaves_last', 'test79c_extreme_b_stops'],
+    'TestRound8': ['test82a_profile_anchor_same_place', 'test82b_moved_before_batch', 'test83a_slow_drift',
+                   'test83b_jitter_no_false_alarm', 'test83c_drift_and_back', 'test84a_rotation', 'test84b_zoom',
+                   'test84c_ir_switch_no_stop', 'test84d_uncertain_then_recovered',
+                   'test87_error_keeps_results'],
     'TestScenarios': ['test8_local_sunlight_no_train', 'test8b_train_during_sunlight'],
 }
 _SKIP_SLOW = os.environ.get('CI') == 'true' and not os.environ.get('TW_FULL')

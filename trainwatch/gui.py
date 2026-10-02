@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.12'
+VERSION = '1.0.13'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -248,28 +248,90 @@ def final_order(files, timing):
     return files, timing, note, overlap
 
 
-def camera_stop_text(cam):
-    """攝影機位置改變而停止判讀的說明（品質摘要、Excel「設定與影片」、results.json 都用這一段）。
-    kind='gap'（錄影中斷前後比對）分 moved／uncertain 兩種說法（#77、#80）"""
+def camera_event_text(cam):
+    """攝影機位置有問題的說明（一段，品質摘要、Excel「設定與影片」、results.json 都用）。
+    v1.0.13 起不停止判讀（#88）：之後的列車全部標需確認。kind：moved＝突然被碰歪；drift＝慢慢偏移、轉動、變焦；
+    uncertain＝一段時間無法確認位置；gap＝錄影中斷前後（moved／uncertain）；profile＝和監測站儲存時的位置不同"""
     name = os.path.basename(cam['file'])
-    tail = ('判讀在這裡停止，之後的影片沒有判讀。\n'
-            '原本參考線與軌道範圍可能已失效，請重新確認監測站設定後，\n從這個時間之後的影片開始判讀。')
-    if cam.get('kind') == 'gap':
-        head = ('錄影中斷後的場景位置和中斷前明顯不同\n（攝影機可能被移動）。\n' if cam.get('result') == 'moved' else
-                '錄影中斷前後的畫面無法確認位置是否相同\n（例如一邊白天、一邊紅外線，或光線差很多）。\n')
-        prev = ('中斷前最後畫面時間：約%s\n' % core.fmt_time(cam['prev_end'], True)) if cam.get('prev_end') is not None else ''
-        return (head + '影片：%s（中斷後的第一支）\n畫面時間：約%s\n' % (name, core.fmt_time(cam['t'], True))
-                + prev + tail)
-    return ('偵測到攝影機位置／角度改變。\n影片：%s（影片內約%s）\n畫面時間：約%s\n'
-            % (name, export.fmt_pos(cam['pos']), core.fmt_time(cam['t'], True))) + tail
+    where = '影片：%s（影片內約%s，畫面時間約%s）' % (name, export.fmt_pos(cam.get('pos') or 0), core.fmt_time(cam['t']))
+    lines = ['●' + core.camera_reason(cam, with_disp=False).replace(' ', '') + '。']
+    if cam.get('disp') and cam.get('result') == 'moved':
+        lines.append('　參考線一帶偏了約%s像素。' % cam['disp'])
+    lines.append('　' + where)
+    if cam.get('kind') == 'uncertain':
+        lines.insert(1, '　（超過 %d 分鐘畫面都無法和原本的位置比對）' % round(core.GEO_STALE / 60))
+    if cam.get('kind') == 'gap' and cam.get('prev_end') is not None:
+        lines.append('　中斷前最後畫面時間：約%s' % core.fmt_time(cam['prev_end']))
+    if cam.get('warm_until'):
+        lines.append('　改變後約%d秒用來重新認識背景，這段畫面已補判讀。' % round(cam['warm_until'] - cam['now']))
+    if cam.get('until'):
+        lines.append('　%s起又和監測站儲存時的畫面確認位置相同，' % core.fmt_time(cam['until']))
+        lines.append('　這段時間的列車都標需人工確認（參考線可能對不準）。')
+    else:
+        lines.append('　%s的列車都標需人工確認（參考線可能對不準）。' % ('全部' if cam.get('kind') == 'profile' else '之後'))
+    return '\n'.join(lines)
+
+
+def error_event_text(err):
+    """判讀途中讀取影片出錯的說明（#87、#88）：跳過這支影片剩下的部分，繼續下一支"""
+    return ('●%s在影片內約%s（畫面時間約%s）讀取出錯，\n　這支影片剩下的部分沒有判讀，從下一支繼續。\n'
+            '　這段時間如果有列車，不會有紀錄，請到影片確認。\n　錯誤內容：%s'
+            % (os.path.basename(err.get('file') or ''), export.fmt_pos(err.get('pos') or 0),
+               core.fmt_time(err['t']) if err.get('t') else '?', err.get('msg', '')[:160]))
+
+
+CAMERA_ADVICE = ('怎麼處理（兩種都可以）：\n'
+                 '①直接用這次的結果：到第2頁逐筆確認標需確認的列車，\n'
+                 '　時間不對就自己修改。\n'
+                 '②要更準確：在第1頁用那支影片的畫面重畫參考線、\n'
+                 '　另存一個監測站，再從那支影片起重新判讀。')
+
+
+def position_check_text(c, kind):
+    """判讀前確認攝影機位置的說明（#82）"""
+    when = '影片：%s（影片內約%s）' % (os.path.basename(c['file']), export.fmt_pos(c['pos']))
+    if kind == 'moved':
+        return ('目前攝影機位置和這個監測站儲存參考線時的位置不同\n'
+                '（參考線、軌道範圍一帶偏了約%s像素）。\n%s\n\n'
+                '原本的參考線與軌道範圍可能對不準，有兩種做法：\n'
+                '　●「回去重設參考線」：在第1頁用這批影片的畫面重新確認（必要時重畫）\n'
+                '　　參考線與軌道範圍，按「儲存」後再判讀（比較準）。\n'
+                '　●「仍要判讀」：照目前的參考線判讀，時間可能有誤差，\n'
+                '　　全部列車標需人工確認，由您到第2頁逐筆確認、修改。' % (c['disp'], when))
+    if kind == 'none':
+        return ('這個監測站是舊版設定（或還沒儲存），沒有攝影機位置基準。\n\n'
+                '請確認上面畫面中的參考線（紅）與軌道範圍（橘）仍在正確的位置。\n%s\n'
+                '確認後程式會記住這個位置，之後判讀會自動比對。' % when)
+    return ('這段影片的畫面和監測站儲存時的畫面比不起來\n'
+            '（例如白天／紅外線不同、光線差很多），無法自動確認攝影機位置。\n%s\n\n'
+            '請比對上面兩張畫面，確認參考線（紅）與軌道範圍（橘）仍在正確的位置。\n'
+            '確認後程式會記住這個畫面，之後同樣的光線就能自動比對。' % when)
+
+
+def overlay_image(frame, profile, width=420):
+    """畫上參考線、軌道範圍的縮圖（判讀前確認位置用）"""
+    import numpy as np
+    import cv2
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    im = frame.copy()
+    x0, y0, x1, y1 = [int(v) for v in profile.track_rect]
+    cv2.rectangle(im, (x0, y0), (x1, y1), (0, 160, 255), 2)
+    (xa, ya), (xb, yb) = profile.ref_line
+    cv2.line(im, (int(xa), int(ya)), (int(xb), int(yb)), (32, 32, 255), max(2, int(profile.ref_width)))
+    h, w = im.shape[:2]
+    im = cv2.resize(im, (width, int(h * width / w)), interpolation=cv2.INTER_AREA)
+    return Image.fromarray(np.ascontiguousarray(im[:, :, ::-1]))
 
 
 def apply_camera_info(info, files, timing):
-    """把 core.process 回傳的攝影機資訊寫進各影片的 timing：stop（停止判讀）、cam_note（位置基準重新建立，#80）"""
-    cam = info.get('camera')
+    """把 core.process 回傳的資訊寫進各影片的 timing：warn（攝影機位置有問題、讀取出錯，#88）、
+    cam_note（位置基準重新建立，#80）"""
     for f, t in zip(files, timing):
-        if cam and f == cam['file']:
-            t['stop'] = camera_stop_text(cam)
+        w = [camera_event_text(c) for c in info.get('camera_events', ()) if c.get('file') == f]
+        w += [error_event_text(e) for e in info.get('errors', ()) if e.get('file') == f]
+        if w:
+            t['warn'] = '\n'.join(w)
         txt = [n['text'] for n in info.get('notes', ()) if n.get('file') == f]
         if txt:
             t['cam_note'] = '；'.join(txt)
@@ -293,9 +355,11 @@ def quality_summary(evs, cancelled=False, timing=()):
     """判讀完成的品質摘要文字（#61）"""
     valid = [e for e in evs if e.get('valid')]
     need = [e for e in valid if e.get('need_check')]
-    stop = next((t.get('stop') for t in timing if t.get('stop')), None)
-    lines = (['判讀中途停止。' + stop, '', '停止前已完成的部分：'] if stop else
-             ['%s判讀完成。' % ('已取消，部分' if cancelled else '')]) + [
+    warns = [t['warn'] for t in timing if t.get('warn')]
+    lines = ['%s判讀完成。' % ('已取消，部分' if cancelled else '')]
+    if warns:
+        lines += ['', '注意：判讀途中發生下列狀況（已繼續判讀）：'] + warns + [CAMERA_ADVICE, '']
+    lines += [
              '列車 %d 筆、已排除 %d 筆。' % (len(valid), len(evs) - len(valid)),
              '需人工確認 %d 筆%s' % (len(need), '，其中：' if need else '。')]
     cnt = {}
@@ -774,6 +838,33 @@ class App:
         self.redraw_overlay()
         self.update_osd_label()
 
+    def _update_anchors(self, p):
+        """儲存監測站時，用目前畫面（畫參考線的這個畫面）建立攝影機位置基準（#82）。
+        參考線或軌道範圍改過（可能是攝影機動了才重畫）：舊的基準只留下和目前畫面確認位置相同的"""
+        fr = self.cur_frame
+        if fr is None:
+            return False
+        geom = (json.dumps(p.ref_line), json.dumps(p.track_rect))
+        keep = list(p.camera_anchors or [])
+        if keep and geom != getattr(self, '_loaded_geom', geom):
+            feats = core.geo_features(fr, p)
+            keep = [a for a in keep if core.geo_verdict(core.geo_compare(core.geo_features(core.anchor_image(a), p), feats, p)) == 'same']
+        p.camera_anchors = core.add_anchor(keep, core.make_anchor(fr, note='儲存監測站'))
+        p.profile_version = 2
+        self._loaded_geom = geom
+        return True
+
+    def _write_profile(self, p, ask=True):
+        fn = ''.join('_' if c in '\\/:*?"<>|' else c for c in p.name) + '.json'
+        path = os.path.join(self.prof_dir, fn)
+        if ask and os.path.exists(path) and not messagebox.askyesno(APP, '「%s」已存在，要覆蓋嗎？' % p.name):
+            return None
+        tmp = path + '.tmp'
+        with open(tmp, 'w', encoding='utf-8') as fh:
+            fh.write(p.to_json())
+        os.replace(tmp, path)
+        return fn
+
     def save_profile(self):
         p = self._collect_profile()
         if self.cur_frame is not None:
@@ -782,16 +873,16 @@ class App:
         path = os.path.join(self.prof_dir, fn)
         if os.path.exists(path) and not messagebox.askyesno(APP, '「%s」已存在，要覆蓋嗎？' % p.name):
             return
+        anchored = self._update_anchors(p)
         try:
-            with open(path, 'w', encoding='utf-8') as fh:
-                fh.write(p.to_json())
+            self._write_profile(p, ask=False)
         except OSError as e:
             messagebox.showerror(APP, '無法儲存：%s' % e)
             return
         self.cb_prof['values'] = self._profile_names()
         self.cb_prof.set(fn[:-5])
         self._remember(fn[:-5])
-        self.var_status.set('已儲存監測站設定：%s' % p.name)
+        self.var_status.set('已儲存監測站設定：%s%s' % (p.name, '（含目前畫面的攝影機位置）' if anchored else ''))
 
     def load_profile(self, name=None):
         name = name or self.cb_prof.get()
@@ -805,6 +896,7 @@ class App:
             messagebox.showerror(APP, '讀取設定失敗：%s' % e)
             return
         self.cb_prof.set(name)
+        self._loaded_geom = (json.dumps(self.profile.ref_line), json.dumps(self.profile.track_rect))
         self._apply_profile_to_ui()
         self._remember(name)
         self.var_status.set('已載入監測站設定：%s' % self.profile.name)
@@ -1425,6 +1517,26 @@ class App:
                             + '\n'.join(overlap[:15]), out))
                 return
             bases = [t['offset'] for t in timing]
+            # 判讀前確認攝影機位置：和監測站儲存時的位置比（#82）
+            chk = core.check_start(files, prof, lambda fr: self.q.put(('prog', 0.06 + fr * 0.02, '確認攝影機位置…')),
+                                   lambda: self.cancel_flag)
+            if self.cancel_flag:
+                self.q.put(('stop', '已取消。', out))
+                return
+            need = [c for c in chk if c['verdict'] in ('moved', 'none', 'uncertain')]
+            if need:
+                ev, ans = threading.Event(), {}
+                self.q.put(('ask_pos', need, prof, ev, ans))
+                ev.wait()
+                if not ans.get('ok'):
+                    self.q.put(('stop', '沒有開始判讀。\n\n請在第1頁確認（必要時重畫）參考線與軌道範圍，按「儲存」後再判讀。'
+                                if any(c['verdict'] == 'moved' for c in need) else '沒有確認攝影機位置，沒有開始判讀。', out))
+                    return
+                confirmed = [c for c in need if c['verdict'] != 'moved']   # 「仍要判讀」的不記成基準
+                for c in confirmed:
+                    prof.camera_anchors = core.add_anchor(prof.camera_anchors, core.make_anchor(c['frame'], note='判讀前使用者確認'))
+                if confirmed:
+                    self.q.put(('anchors', prof.camera_anchors))
             prog = lambda fr, msg: self.q.put(('prog', 0.08 + fr * 0.8, '判讀中：' + msg))
             info = {}
             try:
@@ -1433,14 +1545,14 @@ class App:
                 self.q.put(('stop', str(ex), out))
                 return
             mark_time_jumps(evs, files, timing)
-            apply_camera_info(info, files, timing)                      # 攝影機位置改變 → 判讀已停止（#71、#80）
+            apply_camera_info(info, files, timing)                      # 攝影機位置有問題、讀取出錯（#80、#88）
             core.number_events(evs)
             prog2 = lambda fr, msg: self.q.put(('prog', 0.88 + fr * 0.12, msg))
             core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files, bases=bases)
             for t in timing:
                 if sorted_note:
                     t.setdefault('note', sorted_note)
-            export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing)
+            export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing, VERSION)
             export.write_excel(os.path.join(out, '列車通過紀錄.xlsx'), evs, prof, files, timing)
             export.write_csv(os.path.join(out, '列車通過紀錄.csv'), evs)
             self.q.put(('done', evs, out, files, timing, prof, self.cancel_flag))
@@ -1509,15 +1621,35 @@ class App:
                     self.set_dirty(False)       # 判讀完已自動輸出 Excel
                     nv = sum(1 for e in evs if e['valid'])
                     self.root.after(300, lambda evs=evs, c=cancelled, t=timing: self.show_summary(evs, c, t))
-                    stopped = any(t.get('stop') for t in timing)
+                    stopped = any(t.get('warn') for t in timing)
                     if stopped:
-                        self.var_status.set('⚠ 攝影機位置改變，判讀已停止。\n停止前：列車%d筆、已排除%d筆。\n結果資料夾：%s'
+                        self.var_status.set('⚠ 完成，但判讀途中攝影機位置或影片有狀況（見完成視窗）。\n列車%d筆、已排除%d筆。\n結果資料夾：%s'
                                             % (nv, len(evs) - nv, os.path.basename(out)))
                     else:
                         self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
                             '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
                     self.fill_events()
                     self.nb.select(self.page2)
+                elif kind == 'ask_pos':                         # 判讀前確認攝影機位置（#82）
+                    _, need, prof, ev, ans = m
+                    ok = True
+                    for c in need:
+                        imgs = [('這批影片（%s）' % os.path.basename(c['file']), overlay_image(c['frame'], prof))]
+                        best = self._best_anchor_image(c, prof)
+                        if best is not None:
+                            imgs.insert(0, ('監測站儲存時的畫面', overlay_image(best, prof)))
+                        mv = c['verdict'] == 'moved'
+                        if not self.confirm('確認攝影機位置', position_check_text(c, c['verdict']),
+                                            ok='仍要判讀（全部標需確認）' if mv else '位置正確，開始判讀',
+                                            cancel='回去重設參考線' if mv else '取消', warn=mv, images=imgs):
+                            ok = False
+                            break
+                    ans['ok'] = ok
+                    ev.set()
+                elif kind == 'anchors':                          # 使用者確認過的畫面記進監測站設定
+                    self.profile.camera_anchors = list(m[1])
+                    self.profile.profile_version = 2
+                    self._save_anchors_only(self.profile)
                 elif kind == 'stop':
                     self._run_finished()
                     self._remove_empty(m[2])
@@ -1532,6 +1664,42 @@ class App:
         except queue.Empty:
             pass
         self.root.after(150, self._poll)
+
+    def _save_anchors_only(self, p):
+        """只把位置基準寫回已儲存的監測站設定檔（其他還沒儲存的修改不動）。
+        檔案裡的參考線、軌道範圍和目前不同時不寫（基準是對目前的參考線確認的）"""
+        name = self.cb_prof.get()
+        path = os.path.join(self.prof_dir, name + '.json') if name else ''
+        if not path or not os.path.exists(path):
+            return
+        try:
+            with open(path, encoding='utf-8') as fh:
+                d = json.load(fh)
+            if d.get('ref_line') != p.ref_line or d.get('track_rect') != p.track_rect:
+                return
+            d['camera_anchors'], d['profile_version'] = p.camera_anchors, 2
+            tmp = path + '.tmp'
+            with open(tmp, 'w', encoding='utf-8') as fh:
+                json.dump(d, fh, ensure_ascii=False, indent=2)
+            os.replace(tmp, path)
+        except (OSError, ValueError):
+            pass
+
+    def _best_anchor_image(self, c, prof):
+        """監測站基準裡和這個畫面最像的一張（給使用者比對）：比得起來的取符合點最多的；
+        都比不起來就取光線（彩度）最接近的。沒有基準回傳 None"""
+        import cv2
+        anchors = prof.camera_anchors or []
+        if not anchors:
+            return None
+        feats = core.geo_features(c['frame'], prof)
+        sat = float(cv2.cvtColor(c['frame'], cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+        best, bn = min(anchors, key=lambda a: abs(a.get('sat', 0) - sat)), 0
+        for a in anchors:
+            r = core.geo_compare(core.geo_features(core.anchor_image(a), prof), feats, prof)
+            if r and r['n'] > bn:
+                best, bn = a, r['n']
+        return core.anchor_image(best)
 
     def _run_finished(self):
         self.btn_run.configure(state='normal'); self.btn_cancel.configure(state='disabled')
@@ -1582,7 +1750,7 @@ class App:
             messagebox.showwarning(APP, '無法儲存預設位置（程式資料夾和使用者資料夾都不能寫入），這次仍會使用您選的位置。')
 
     def show_summary(self, evs, cancelled, timing):
-        need = any(e.get('need_check') for e in evs if e.get('valid')) or any(t.get('stop') for t in timing)
+        need = any(e.get('need_check') for e in evs if e.get('valid')) or any(t.get('warn') for t in timing)
         self.confirm('判讀完成', quality_summary(evs, cancelled, timing), ok='知道了', cancel=None,
                      warn=need, icon=None if need else '✓')
 
@@ -1913,7 +2081,7 @@ class App:
             return
         prof = self.run_profile or self.profile
         try:
-            export.save_json(os.path.join(self.result_dir, 'results.json'), self.events, prof, self.run_files, self.run_timing)
+            export.save_json(os.path.join(self.result_dir, 'results.json'), self.events, prof, self.run_files, self.run_timing, VERSION)
             export.write_excel(os.path.join(self.result_dir, '列車通過紀錄.xlsx'), self.events, prof, self.run_files, self.run_timing)
             export.write_csv(os.path.join(self.result_dir, '列車通過紀錄.csv'), self.events)
         except PermissionError:
@@ -1991,7 +2159,7 @@ class App:
         self.set_dirty(False)
         self.fill_events()
 
-    def confirm(self, title, msg, ok='確定', cancel='取消', warn=False, icon=None):
+    def confirm(self, title, msg, ok='確定', cancel='取消', warn=False, icon=None, images=None):
         """自訂確認視窗（按鈕文字固定是中文，不受作業系統語言影響）。確定→True，取消／關掉視窗→False。
         cancel=None：只有一個按鈕（通知用）"""
         w = tk.Toplevel(self.root)
@@ -1999,10 +2167,19 @@ class App:
         w.transient(self.root)
         w.resizable(False, False)
         res = {'v': False}
+        if images:                                   # [(說明, PIL 圖)]：並排顯示（判讀前確認位置，#82）
+            row = ttk.Frame(w, padding=(18, 14, 18, 0)); row.pack(fill='x')
+            w._imgs = []
+            for cap, im in images:
+                col = ttk.Frame(row); col.pack(side='left', padx=(0, 12))
+                ph = ImageTk.PhotoImage(im)
+                w._imgs.append(ph)
+                tk.Label(col, image=ph).pack()
+                ttk.Label(col, text=cap).pack(anchor='w', pady=(4, 0))
         body = ttk.Frame(w, padding=(18, 16, 18, 8)); body.pack(fill='both')
         tk.Label(body, text=icon or ('⚠' if warn else '？'), fg='#c05000' if warn else '#1060c0',
                  font=(self.font_family, 22, 'bold')).pack(side='left', anchor='n', padx=(0, 12))
-        ttk.Label(body, text=msg, justify='left', wraplength=440).pack(side='left', fill='x')
+        ttk.Label(body, text=msg, justify='left', wraplength=860 if images else 440).pack(side='left', fill='x')
         bar = ttk.Frame(w, padding=(18, 4, 18, 14)); bar.pack(fill='x')
 
         def done(v):
