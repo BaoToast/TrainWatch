@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.13'
+VERSION = '1.0.14'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -269,6 +269,8 @@ def camera_event_text(cam):
         lines.append('　這段時間的列車都標需人工確認（參考線可能對不準）。')
     else:
         lines.append('　%s的列車都標需人工確認（參考線可能對不準）。' % ('全部' if cam.get('kind') == 'profile' else '之後'))
+    lines.append('　⚠偏移較大時參考線可能沒對到軌道，列車可能')
+    lines.append('　整筆沒抓到（漏判），沒抓到的不會出現在需確認清單裡。')
     return '\n'.join(lines)
 
 
@@ -284,7 +286,9 @@ CAMERA_ADVICE = ('怎麼處理（兩種都可以）：\n'
                  '①直接用這次的結果：到第2頁逐筆確認標需確認的列車，\n'
                  '　時間不對就自己修改。\n'
                  '②要更準確：在第1頁用那支影片的畫面重畫參考線、\n'
-                 '　另存一個監測站，再從那支影片起重新判讀。')
+                 '　另存一個監測站，再從那支影片起重新判讀。\n'
+                 '攝影機偏移較大（畫面明顯不同）時建議用②：\n'
+                 '可能有列車整筆沒抓到（漏判），①的清單裡看不到。')
 
 
 def position_check_text(c, kind):
@@ -297,7 +301,8 @@ def position_check_text(c, kind):
                 '　●「回去重設參考線」：在第1頁用這批影片的畫面重新確認（必要時重畫）\n'
                 '　　參考線與軌道範圍，按「儲存」後再判讀（比較準）。\n'
                 '　●「仍要判讀」：照目前的參考線判讀，時間可能有誤差，\n'
-                '　　全部列車標需人工確認，由您到第2頁逐筆確認、修改。' % (c['disp'], when))
+                '　　全部列車標需人工確認，由您到第2頁逐筆確認、修改。\n'
+                '　　偏移較大時，列車也可能整筆沒抓到（漏判），沒抓到的不會出現在清單裡。' % (c['disp'], when))
     if kind == 'none':
         return ('這個監測站是舊版設定（或還沒儲存），沒有攝影機位置基準。\n\n'
                 '請確認上面畫面中的參考線（紅）與軌道範圍（橘）仍在正確的位置。\n%s\n'
@@ -306,6 +311,22 @@ def position_check_text(c, kind):
             '（例如白天／紅外線不同、光線差很多），無法自動確認攝影機位置。\n%s\n\n'
             '請比對上面兩張畫面，確認參考線（紅）與軌道範圍（橘）仍在正確的位置。\n'
             '確認後程式會記住這個畫面，之後同樣的光線就能自動比對。' % when)
+
+
+def save_moved_text(disp):
+    """儲存監測站時發現攝影機位置和原本不同（#89）"""
+    return ('目前畫面的攝影機位置和這個監測站原本的位置不同\n（參考線、軌道範圍一帶偏了約%s像素），'
+            '但參考線與軌道範圍還沒有重畫。\n\n'
+            '如果直接把這個畫面存成位置基準，之後歪掉的參考線會被當成正常，\n'
+            '所以這次沒有把它存成位置基準（其他設定已照常儲存）。\n\n'
+            '請在這個畫面上確認或重畫參考線（紅）與軌道範圍（橘），再按一次「儲存」。' % disp)
+
+
+def save_uncertain_text():
+    """儲存監測站時，目前畫面和原本的位置基準比不起來（#89）"""
+    return ('目前畫面和監測站原本的畫面比不起來\n（例如白天／紅外線不同、光線差很多），無法自動確認攝影機位置。\n\n'
+            '請比對上面兩張畫面，確認參考線（紅）與軌道範圍（橘）仍在正確的位置。\n'
+            '按「位置正確」，程式會記住這個畫面，之後同樣的光線就能自動比對。')
 
 
 def overlay_image(frame, profile, width=420):
@@ -839,20 +860,40 @@ class App:
         self.update_osd_label()
 
     def _update_anchors(self, p):
-        """儲存監測站時，用目前畫面（畫參考線的這個畫面）建立攝影機位置基準（#82）。
-        參考線或軌道範圍改過（可能是攝影機動了才重畫）：舊的基準只留下和目前畫面確認位置相同的"""
+        """儲存監測站時，用目前畫面（畫參考線的這個畫面）更新攝影機位置基準（#82、#89）。回傳狀態說明（空字串＝沒有畫面）：
+        - 參考線或軌道範圍重畫過：用目前畫面建基準，舊的只留下和目前畫面確認位置相同的
+        - 沒重畫、位置相同：照存（不重複加幾乎一樣的）
+        - 沒重畫、位置不同：**不把目前畫面存成基準**（不然歪掉的位置會變成合法），其他設定照存，跳出提醒
+        - 沒重畫、比不起來（白天↔夜間等）：並排顯示兩張畫面，使用者確認位置正確才加"""
         fr = self.cur_frame
         if fr is None:
-            return False
+            return ''
         geom = (json.dumps(p.ref_line), json.dumps(p.track_rect))
-        keep = list(p.camera_anchors or [])
-        if keep and geom != getattr(self, '_loaded_geom', geom):
-            feats = core.geo_features(fr, p)
-            keep = [a for a in keep if core.geo_verdict(core.geo_compare(core.geo_features(core.anchor_image(a), p), feats, p)) == 'same']
-        p.camera_anchors = core.add_anchor(keep, core.make_anchor(fr, note='儲存監測站'))
+        changed = geom != getattr(self, '_loaded_geom', geom)
+        plan = core.plan_anchor_save(p, fr, changed)
+        v = plan['verdict']
+        if v == 'moved':
+            self.confirm('攝影機位置和原本不同', save_moved_text(plan['disp']), ok='知道了', cancel=None, warn=True,
+                         images=self._anchor_pair(p, fr))
+            return 'moved'
+        if v == 'uncertain':
+            ok = self.confirm('確認攝影機位置', save_uncertain_text(), ok='位置正確，記住這個畫面', cancel='不要記住',
+                              images=self._anchor_pair(p, fr))
+            if not ok:
+                return 'skip'
+            plan = core.plan_anchor_save(p, fr, changed, confirmed=True)
+        p.camera_anchors = plan['anchors']
         p.profile_version = 2
         self._loaded_geom = geom
-        return True
+        return 'ok'
+
+    def _anchor_pair(self, p, fr):
+        """「監測站儲存時的畫面」＋「目前畫面」兩張縮圖（都畫上參考線、軌道範圍）"""
+        imgs = [('目前畫面', overlay_image(fr, p))]
+        best = self._best_anchor_image(dict(frame=fr), p)
+        if best is not None:
+            imgs.insert(0, ('監測站儲存時的畫面', overlay_image(best, p)))
+        return imgs
 
     def _write_profile(self, p, ask=True):
         fn = ''.join('_' if c in '\\/:*?"<>|' else c for c in p.name) + '.json'
@@ -882,7 +923,10 @@ class App:
         self.cb_prof['values'] = self._profile_names()
         self.cb_prof.set(fn[:-5])
         self._remember(fn[:-5])
-        self.var_status.set('已儲存監測站設定：%s%s' % (p.name, '（含目前畫面的攝影機位置）' if anchored else ''))
+        self.var_status.set('已儲存監測站設定：%s%s' % (p.name, {
+            'ok': '（含目前畫面的攝影機位置）',
+            'moved': '\n⚠ 攝影機位置和原本不同，這個畫面沒有存成位置基準，請重畫參考線後再儲存。',
+            'skip': '（這個畫面沒有存成位置基準）'}.get(anchored, '')))
 
     def load_profile(self, name=None):
         name = name or self.cb_prof.get()
@@ -1534,7 +1578,7 @@ class App:
                     return
                 confirmed = [c for c in need if c['verdict'] != 'moved']   # 「仍要判讀」的不記成基準
                 for c in confirmed:
-                    prof.camera_anchors = core.add_anchor(prof.camera_anchors, core.make_anchor(c['frame'], note='判讀前使用者確認'))
+                    prof.camera_anchors = core.add_anchor(prof.camera_anchors, core.make_anchor(c['frame'], note='判讀前使用者確認'), prof)
                 if confirmed:
                     self.q.put(('anchors', prof.camera_anchors))
             prog = lambda fr, msg: self.q.put(('prog', 0.08 + fr * 0.8, '判讀中：' + msg))

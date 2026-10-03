@@ -889,6 +889,182 @@ class TestRound8(unittest.TestCase):
         self.assertNotIn('可接受誤差是 5 秒', inspect.getsource(core))
 
 
+class TestRound9(unittest.TestCase):
+    """v1.0.14：儲存監測站不可以污染位置基準（#89）、基準去重（#90）、照實際時間字幕位置遮罩（#91）、
+    漏判提醒（#92）、說明不過度推論（#93）、慢慢轉動／變焦的累積偏移（#94）"""
+    scene = TestRound2.scene
+    valid = TestRound2.valid
+    run_info = TestRound4.run_info
+
+    @staticmethod
+    def frame(f, at=1.0):
+        fr, _ = core.geo_frame_at(f, at)
+        return fr
+
+    def ab(self):
+        d, a, _ = self.scene('a.avi', 5, texture=3000)
+        d, b, _ = self.scene('b.avi', 5, texture=3000, camera_shift=(0, 14, 9, 1.5))
+        return self.frame(a), self.frame(b)
+
+    def test89a_save_same_place(self):
+        """#89 監測站基準 A、目前畫面仍是 A、參考線沒改 → 可以儲存；不多加一張幾乎一樣的基準"""
+        A, B = self.ab()
+        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        r = core.plan_anchor_save(p, A, geom_changed=False)
+        self.assertEqual(r['verdict'], 'same')
+        self.assertEqual(len(r['anchors']), 1)
+
+    def test89b_save_moved_not_polluted(self):
+        """#89 基準 A、攝影機已移到 B、參考線沒改就按儲存 → 回報 moved，B 不可以變成合法基準"""
+        A, B = self.ab()
+        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        r = core.plan_anchor_save(p, B, geom_changed=False)
+        self.assertEqual(r['verdict'], 'moved')
+        self.assertEqual(len(r['anchors']), 1)                 # 只有原本的 A
+        p.camera_anchors = r['anchors']
+        self.assertEqual([x['verdict'] for x in core.check_start([self._write(B)], p)], ['moved'])
+
+    def _write(self, fr):
+        import cv2
+        d = _mkdtemp(); f = os.path.join(d, 'x.avi')
+        w = cv2.VideoWriter(f, cv2.VideoWriter_fourcc(*'MJPG'), 15.0, (fr.shape[1], fr.shape[0]))
+        for _ in range(30):
+            w.write(fr)
+        w.release()
+        return f
+
+    def test89c_redrawn_lines_new_anchor(self):
+        """#89 攝影機移到 B，使用者重畫參考線後儲存 → 建立 B 的基準，和 B 位置不同的舊基準 A 移除"""
+        A, B = self.ab()
+        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        r = core.plan_anchor_save(p, B, geom_changed=True)
+        self.assertEqual(r['verdict'], 'new')
+        self.assertEqual(len(r['anchors']), 1)
+        q = core.Profile(); q.camera_anchors = r['anchors']
+        self.assertEqual(core.plan_anchor_save(q, B, geom_changed=False)['verdict'], 'same')
+
+    def test89d_save_uncertain_needs_confirm(self):
+        """#89 目前畫面和基準比不起來（白天↔紅外線）、參考線沒改 → uncertain，不自動加入（要使用者確認）"""
+        d, a, _ = self.scene('a.avi', 5, texture=3000)
+        A = self.frame(a)
+        noise = np.random.default_rng(3).integers(0, 255, A.shape, np.uint8)
+        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        r = core.plan_anchor_save(p, noise, geom_changed=False)
+        self.assertEqual(r['verdict'], 'uncertain')
+        self.assertEqual(len(r['anchors']), 1)
+        r2 = core.plan_anchor_save(p, noise, geom_changed=False, confirmed=True)
+        self.assertEqual(len(r2['anchors']), 2)
+
+    def test90_dedup(self):
+        """#90 同一位置、同樣光線連續儲存 10 次 → 不會變成 8 張幾乎一樣的；原本另一種光線的基準不可以被擠掉"""
+        d, a, _ = self.scene('a.avi', 5, texture=3000)
+        d, n, _ = self.scene('n.avi', 5, texture=3000, ir_at=0)
+        A, N = self.frame(a), self.frame(n)
+        p = core.Profile(); p.camera_anchors = [core.make_anchor(A), core.make_anchor(N, note='夜間')]
+        for _ in range(10):
+            p.camera_anchors = core.add_anchor(p.camera_anchors, core.make_anchor(A), p)
+        self.assertLessEqual(len(p.camera_anchors), 2)
+        self.assertIn('夜間', [x.get('note') for x in p.camera_anchors])
+
+    def test91a_mask_uses_osd_rect(self):
+        """#91 時間字幕在右下角 → 位置比對與亮度估計都要遮掉那一塊（不是只遮上方 40 像素）"""
+        p = core.Profile(); p.osd_rect = [440, 330, 630, 350]
+        m = core._geo_mask(p, 640, 360)
+        self.assertEqual(int(m[340, 500]), 0)
+        self.assertEqual(int(m[340, 100]), 255)
+        g = core.CameraGuard(p)
+        mk = g._mask(640, 360)
+        self.assertFalse(mk[340 // 2, 500 // 2])
+        det = core.Detector(p, core.work_crop(p, 640, 360))
+        sm = np.full((360 // det.EXPO_SCALE, 640 // det.EXPO_SCALE), 100, np.float32)
+        det.bg_small = sm.copy()
+        det._exposure_calc(sm)
+        self.assertFalse(det.out_mask[340 // det.EXPO_SCALE, 500 // det.EXPO_SCALE])
+
+    def test91b_osd_bottom_right_no_false_alarm(self):
+        """#91 字幕在右下角、每秒跳動，攝影機沒動 → 不可以有攝影機位置警告，列車判讀得到"""
+        import cv2
+        d = _mkdtemp()
+        src, f = os.path.join(d, 's.avi'), os.path.join(d, 'f.avi')
+        selftest.make_scene(src, 90, trains=[dict(t0=60, d=1)], texture=3000)
+        c = cv2.VideoCapture(src)
+        w = cv2.VideoWriter(f, cv2.VideoWriter_fourcc(*'MJPG'), selftest.FPS, (selftest.W, selftest.H))
+        i = 0
+        while True:
+            ok, fr = c.read()
+            if not ok:
+                break
+            cv2.rectangle(fr, (440, 328), (632, 352), (0, 0, 0), -1)
+            cv2.putText(fr, '2030-01-01 08:%02d:%02d' % (i // 15 // 60, i // 15 % 60), (446, 347),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 255, 255), 2)
+            w.write(fr); i += 1
+        w.release(); c.release()
+        p = core.Profile(); p.osd_rect = [440, 328, 632, 352]
+        evs, info = self.run_info([f], [0.0], p)
+        self.assertNotIn('camera', info, info)
+        self.assertEqual(len(self.valid(evs)), 1)
+
+    def test92_missed_train_warning(self):
+        """#92 攝影機位置改變後繼續判讀的提醒，要明講「可能整筆沒抓到（漏判）」"""
+        try:
+            from trainwatch import gui
+        except Exception as e:
+            self.skipTest(str(e))
+        t0 = dt.datetime(2030, 1, 1, 8, 0, 0).timestamp()
+        for k in ('moved', 'drift', 'profile'):
+            x = gui.camera_event_text(dict(t=t0, file='x/a.mkv', pos=1.0, kind=k, result='moved', disp=8.0, now=t0))
+            self.assertIn('漏判', x, k)
+        c = dict(file='x/a.mkv', pos=1.0, disp=8.0)
+        self.assertIn('漏判', gui.position_check_text(c, 'moved'))
+        self.assertIn('漏判', gui.CAMERA_ADVICE)
+
+    def test93_no_px_to_seconds_claim(self):
+        """#93 不可以把 6 像素固定換算成秒數當成保證"""
+        import inspect
+        self.assertNotIn('0.02～0.06 秒', inspect.getsource(core))
+
+    def geo_track(self, cam_path, rehome):
+        """直接用 CameraGuard 跑一段慢慢轉動／變焦的畫面，回傳 (程式算出的偏移, 真正的偏移)"""
+        import cv2
+        d, f, _ = self.scene('a.avi', 100, texture=3000, cam_path=cam_path)
+        p = core.Profile()
+        g = core.CameraGuard(p)
+        old = core.GEO_REHOME
+        core.GEO_REHOME = rehome
+        try:
+            c = cv2.VideoCapture(f)
+            i = 0
+            while True:
+                ok, fr = c.read()
+                if not ok:
+                    break
+                t = i / selftest.FPS
+                g.check(t, fr, 50.0, False, f, t)
+                i += 1
+            c.release()
+        finally:
+            core.GEO_REHOME = old
+        k = cam_path[-1]
+        dx, dy, ang, sc = (list(k[1:]) + [0.0, 1.0])[:4] if len(k) < 5 else k[1:]
+        M = cv2.getRotationMatrix2D((selftest.W / 2, selftest.H / 2), ang, sc)
+        M[0, 2] += dx; M[1, 2] += dy
+        pts = core.geo_points(p)
+        truth = pts @ M[:, :2].T + M[:, 2] - pts
+        return g.geo_off, truth
+
+    def test94a_slow_rotation_rehome(self):
+        """#94 100 秒內慢慢轉 3 度，而且每次比對都換比較畫面（最壞情況）→ 程式算的累積偏移和真正的差 < 1.5 像素"""
+        got, truth = self.geo_track([(0, 0, 0, 0.0, 1.0), (95, 0, 0, 3.0, 1.0)], rehome=10 ** 6)
+        err = float(np.max(np.hypot(*(got - truth).T)))
+        self.assertLess(err, 1.5, (got.round(1).tolist(), truth.round(1).tolist()))
+
+    def test94b_slow_zoom_rehome(self):
+        """#94 100 秒內慢慢變焦 4%，每次比對都換比較畫面 → 累積偏移和真正的差 < 1.5 像素"""
+        got, truth = self.geo_track([(0, 0, 0, 0.0, 1.0), (95, 0, 0, 0.0, 1.04)], rehome=10 ** 6)
+        err = float(np.max(np.hypot(*(got - truth).T)))
+        self.assertLess(err, 1.5, (got.round(1).tolist(), truth.round(1).tolist()))
+
+
 class TestRound2Gui(unittest.TestCase):
     """v1.0.9：介面這邊的檢查函式（不開視窗）"""
     def setUp(self):
@@ -1222,6 +1398,7 @@ SLOW_TESTS = {
                    'test83b_jitter_no_false_alarm', 'test83c_drift_and_back', 'test84a_rotation', 'test84b_zoom',
                    'test84c_ir_switch_no_stop', 'test84d_uncertain_then_recovered',
                    'test87_error_keeps_results'],
+    'TestRound9': ['test91b_osd_bottom_right_no_false_alarm', 'test94a_slow_rotation_rehome', 'test94b_slow_zoom_rehome'],
     'TestScenarios': ['test8_local_sunlight_no_train', 'test8b_train_during_sunlight'],
 }
 _SKIP_SLOW = os.environ.get('CI') == 'true' and not os.environ.get('TW_FULL')

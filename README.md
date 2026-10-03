@@ -88,6 +88,8 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 
 ## 監測站的攝影機位置基準、幾何位置（v1.0.13，修正清單 #82～#87）
 
+- v1.0.14（#89～#96）：儲存監測站用 `plan_anchor_save()`：沒有舊基準或參考線重畫過＝new；參考線沒改時先比對，same＝照存（`add_anchor(…, profile)` 去重：同位置、符合點 ≥ 160、彩度差 < 10 就不重複加），moved＝**不加**、跳出提醒（其他設定照存），uncertain＝使用者確認才加。時間字幕遮罩改用 `osd_box(profile)`（`osd_rect` ±8 像素，另外照舊遮上方 40 像素），用在 `_geo_mask`、`CameraGuard._mask`、`_exposure_calc`。慢慢轉動 3 度、變焦 4%、每次都換比較畫面時，累積偏移和真正的差 ≤ 0.43 像素，所以維持「偏移相加」不改矩陣相乘（test94a／94b）。
+
 - 儲存監測站時，用畫參考線的那個畫面存一張位置基準（`Profile.camera_anchors`，灰階 JPEG base64，最多 8 張，第一張保留）。`profile_version`＝2；沒有這個欄位的＝1（舊版）。results.json 只記張數（`camera_anchor_count`），另記 `app_version`。
 - 比較方法：ORB 特徵點＋RANSAC（`estimateAffinePartial2D`），量參考線兩端、中點與軌道範圍四個角實際偏了幾像素（取最大）。符合點 < 40＝比不起來；< 3 像素＝相同；≥ 6＝移動；中間＝無法確認。
   - 真實樣本：同一支影片 10 分鐘內每次都比得起來（符合點 127～1227）、偏移最大 0.8；夜間相隔約 5 小時 ≤ 0.1；白天上午↔下午、白天↔夜間比不起來（≤ 27）。

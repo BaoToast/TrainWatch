@@ -112,16 +112,30 @@ GEO_STEP = 30.0       # 判讀途中每幾秒比一次（一次約 50 毫秒，2
 GEO_OK = 40           # 符合的特徵點至少幾個才算比得起來
 GEO_REHOME = 80       # 少於這個數（光線慢慢改變）就換新的比較畫面，累積的偏移量保留（不會歸零）
 GEO_SAME = 3.0        # 偏移小於幾像素＝位置相同
-GEO_MOVE = 6.0        # 偏移幾像素以上＝移動（6 像素在參考線上約差 0.02～0.06 秒；門檻依真實樣本的量測雜訊訂）
+GEO_MOVE = 6.0        # 偏移幾像素以上＝移動。依真實樣本的量測穩定度訂（同一位置偏移 < 1 像素）；實際會造成多少
+                      # 時間誤差，要看列車速度與畫面幾何（慢車、停車再開時誤差較大），不能固定換算成秒數（#93）
 GEO_STALE = 300.0     # 判讀途中超過幾秒都比不起來（也比不上監測站基準）→ 記下「無法確認位置」，之後的列車標需確認（#84、#88）
 _ORB = []
+
+
+def osd_box(profile, k=1, pad=8):
+    """時間字幕所在的範圍（照第 1 頁框的「時間字幕位置」，四周多留 pad 像素），縮小 k 倍。回傳 (y0, y1, x0, x1)。
+    字幕每秒跳動，攝影機位置比對與亮度估計都要遮掉（#91；v1.0.13 以前寫死只遮上方 40 像素）"""
+    try:
+        x0, y0, x1, y1 = [int(v) for v in profile.osd_rect]
+    except Exception:
+        return 0, 0, 0, 0
+    x0, x1 = sorted((x0, x1)); y0, y1 = sorted((y0, y1))
+    return max(0, (y0 - pad) // k), (y1 + pad) // k + 1, max(0, (x0 - pad) // k), (x1 + pad) // k + 1
 
 
 def _geo_mask(profile, w, h):
     m = np.full((h, w), 255, np.uint8)
     x0, y0, x1, y1 = profile.track_rect
     m[max(0, int(min(y0, y1)) - 20):int(max(y0, y1)) + 21, max(0, int(min(x0, x1)) - 20):int(max(x0, x1)) + 21] = 0
-    m[:40] = 0                     # 上方時間字幕
+    m[:40] = 0                     # 上方（多數攝影機的時間字幕在這裡）
+    a, b, c, d = osd_box(profile)
+    m[a:b, c:d] = 0                # 實際的時間字幕位置
     return m
 
 
@@ -200,12 +214,49 @@ def anchor_image(a):
 MAX_ANCHORS = 8
 
 
-def add_anchor(anchors, a):
-    """加一張位置基準；最多 MAX_ANCHORS 張（第一張＝儲存監測站時的畫面一定保留，其餘留最新的）"""
-    out = list(anchors or []) + [a]
+def add_anchor(anchors, a, profile=None):
+    """加一張位置基準；最多 MAX_ANCHORS 張（第一張＝儲存監測站時的畫面一定保留，其餘留最新的）。
+    給 profile 時先去重（#90）：和某一張位置相同、符合點很多（光線差不多）、彩度也接近 → 不重複加，
+    取代那一張（第一張不取代），避免連按幾次儲存就把夜間、傍晚等不同光線的基準擠掉"""
+    out = list(anchors or [])
+    if profile is not None and out:
+        fa = geo_features(anchor_image(a), profile)
+        for i, x in enumerate(out):
+            r = geo_compare(geo_features(anchor_image(x), profile), fa, profile)
+            if (r and r['n'] >= GEO_REHOME * 2 and geo_verdict(r) == 'same'
+                    and abs(float(x.get('sat', 0)) - float(a.get('sat', 0))) < 10):
+                if i > 0:
+                    out[i] = a
+                return out
+    out.append(a)
     if len(out) > MAX_ANCHORS:
         out = out[:1] + out[-(MAX_ANCHORS - 1):]
     return out
+
+
+def plan_anchor_save(profile, frame, geom_changed, confirmed=False):
+    """儲存監測站時，要不要把目前畫面加進位置基準（#89）。回傳 dict(verdict, anchors, disp)：
+    - new：沒有舊基準，或參考線／軌道範圍重畫過 → 用目前畫面建基準；舊的只留下和目前畫面位置相同的
+    - same：參考線沒改、位置和舊基準相同 → 可以存（去重）
+    - moved：參考線沒改、位置和舊基準不同 → **不加**（不然歪掉的位置會變成合法），其他設定照存
+    - uncertain：比不起來（白天↔夜間等）→ 使用者確認位置正確（confirmed）才加"""
+    olds = list(profile.camera_anchors or [])
+    new = make_anchor(frame, note='儲存監測站')
+    if not olds:
+        return dict(verdict='new', anchors=[new], disp=None)
+    feats = geo_features(frame, profile)
+    res = [geo_compare(geo_features(anchor_image(a), profile), feats, profile) for a in olds]
+    verds = [geo_verdict(r) for r in res]
+    if geom_changed:
+        keep = [a for a, v in zip(olds, verds) if v == 'same']
+        return dict(verdict='new', anchors=add_anchor(keep, new, profile) if keep else [new], disp=None)
+    for want in ('same', 'moved'):
+        hit = [i for i, v in enumerate(verds) if v == want]
+        if hit:
+            i = max(hit, key=lambda k: res[k]['n'])
+            disp = round(geo_disp(res[i]['off']), 1)
+            return dict(verdict=want, anchors=add_anchor(olds, new, profile) if want == 'same' else olds, disp=disp)
+    return dict(verdict='uncertain', anchors=add_anchor(olds, new, profile) if confirmed else olds, disp=None)
 
 
 def best_anchor(feats, anchor_feats, profile):
@@ -332,7 +383,9 @@ class CameraGuard:
         m = np.ones((h // k, w // k), bool)
         x0, y0, x1, y1 = self.p.track_rect
         m[max(0, (min(y0, y1) - 20) // k):(max(y0, y1) + 20) // k + 1, max(0, (min(x0, x1) - 20) // k):(max(x0, x1) + 20) // k + 1] = False
-        m[:40 // k] = False      # 上方時間字幕
+        m[:40 // k] = False      # 上方（多數攝影機的時間字幕在這裡）
+        a, b, c, d = osd_box(self.p, k)
+        m[a:b, c:d] = False      # 實際的時間字幕位置（#91）
         return m
 
     def prep(self, frame_bgr):
@@ -744,6 +797,8 @@ class Detector:
             x0, y0, x1, y1 = self.p.track_rect
             m[max(0, (min(y0, y1) - 20) // k):(max(y0, y1) + 20) // k + 1, max(0, (min(x0, x1) - 20) // k):(max(x0, x1) + 20) // k + 1] = False
             m[:40 // k] = False
+            a, b, c, d = osd_box(self.p, k)
+            m[a:b, c:d] = False                # 實際的時間字幕位置（#91）
             self.out_mask = m
         sel = self.out_mask & (self.bg_small > 15) & (self.bg_small < 245)
         if sel.sum() < 50:
