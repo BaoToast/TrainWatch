@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.14'
+VERSION = '1.0.15'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -487,6 +487,18 @@ class App:
         self.out_default = d if isinstance(d, str) and d else None   # None＝影片旁邊
         self.out_location = self.out_default                            # 這次要用的位置
 
+        # 程式在背景（切到其他視窗、縮小）時要跳出的確認視窗，先排隊，等使用者回到這個程式再開（#97）
+        self._attn_pending = []
+        self._attn_running = False
+        self._attn_job = None
+        self.attn_bar = tk.Frame(root, bg='#fff3cd', highlightthickness=1, highlightbackground='#e0a800')
+        self.var_attn = tk.StringVar()
+        tk.Label(self.attn_bar, textvariable=self.var_attn, bg='#fff3cd', fg='#7a4a00', justify='left',
+                 font=(self.font_family, 11, 'bold')).pack(side='left', padx=(12, 8), pady=8)
+        self.btn_attn = ttk.Button(self.attn_bar, text='開啟確認視窗', command=self._attn_open_now)
+        self.btn_attn.pack(side='right', padx=12, pady=6)
+        self._run_locked = []        # 判讀中要鎖住的第 1 頁控制項（#98）
+        self._run_lock_on = False
         self.nb = ttk.Notebook(root)
         self.nb.pack(fill='both', expand=True, padx=6, pady=6)
         self.page1 = ScrollArea(self.nb, *TAB_MIN[1])
@@ -560,21 +572,21 @@ class App:
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 2))
         ttk.Label(r, text='名稱').pack(side='left')
         self.var_name = tk.StringVar(value=self.profile.name)
-        ttk.Entry(r, textvariable=self.var_name).pack(side='left', fill='x', expand=True, padx=(6, 0))
+        self._lk(ttk.Entry(r, textvariable=self.var_name)).pack(side='left', fill='x', expand=True, padx=(6, 0))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(2, 6))
-        self.cb_prof = ttk.Combobox(r, state='readonly', width=14, values=self._profile_names())
+        self.cb_prof = self._lk(ttk.Combobox(r, state='readonly', width=14, values=self._profile_names()))
         self.cb_prof.pack(side='left', fill='x', expand=True)
-        ttk.Button(r, text='載入', width=5, command=self.load_profile).pack(side='left', padx=(4, 0))
-        ttk.Button(r, text='儲存', width=5, command=self.save_profile).pack(side='left', padx=(4, 0))
-        ttk.Button(r, text='進階…', width=6, command=self.advanced).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='載入', width=5, command=self.load_profile)).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='儲存', width=5, command=self.save_profile)).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='進階…', width=6, command=self.advanced)).pack(side='left', padx=(4, 0))
 
         box = vbox = ttk.LabelFrame(left, text='影片（同一台攝影機）')
         box.pack(fill='both', expand=True, pady=(0, 6))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 2))
-        ttk.Button(r, text='加入影片…', command=self.add_files).pack(side='left')
-        ttk.Button(r, text='移除', width=5, command=self.remove_files).pack(side='left', padx=(4, 0))
-        ttk.Button(r, text='清空', width=5, command=self.clear_files).pack(side='left', padx=(4, 0))
-        ttk.Button(r, text='依時間排序', command=self.sort_files).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='加入影片…', command=self.add_files)).pack(side='left')
+        self._lk(ttk.Button(r, text='移除', width=5, command=self.remove_files)).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='清空', width=5, command=self.clear_files)).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='依時間排序', command=self.sort_files)).pack(side='left', padx=(4, 0))
         fr = ttk.Frame(box); fr.pack(fill='both', expand=True, padx=6, pady=2)
         self.tv_files = ttk.Treeview(fr, columns=('name', 'start'), show='headings', selectmode='extended', height=2)
         self.tv_files.heading('name', text='檔名'); self.tv_files.heading('start', text='畫面上的開始時間')
@@ -595,10 +607,10 @@ class App:
         lr = ttk.Frame(r); lr.pack(side='top', fill='x')
         ttk.Label(lr, text='手動開始時間').pack(side='left')
         ttk.Label(lr, text='例：2026-01-01 08:00:00', style='Hint.TLabel').pack(side='left', padx=(8, 0))
-        ttk.Button(r, text='清除', width=5, command=self.clear_file_time).pack(side='right')
-        ttk.Button(r, text='套用', width=5, command=self.set_file_time).pack(side='right', padx=(4, 4))
+        self._lk(ttk.Button(r, text='清除', width=5, command=self.clear_file_time)).pack(side='right')
+        self._lk(ttk.Button(r, text='套用', width=5, command=self.set_file_time)).pack(side='right', padx=(4, 4))
         self.var_ftime = tk.StringVar()
-        ttk.Entry(r, textvariable=self.var_ftime).pack(side='left', fill='x', expand=True)
+        self._lk(ttk.Entry(r, textvariable=self.var_ftime)).pack(side='left', fill='x', expand=True)
         # 清單下面這幾行先排（由下往上），視窗矮的時候縮的是影片清單，不會把手動時間那一行擠掉
         for w in (r, hint, self.lbl_count):
             w.pack_configure(side='bottom', before=fr)
@@ -608,8 +620,8 @@ class App:
         self.var_outloc = tk.StringVar()
         ttk.Label(box, textvariable=self.var_outloc, foreground='#1060c0', wraplength=330, justify='left').pack(fill='x', padx=6, pady=(4, 0))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(2, 0))
-        ttk.Button(r, text='選擇存放位置…', command=self.choose_out_location).pack(side='left')
-        ttk.Button(r, text='改回影片旁邊', command=self.reset_out_location).pack(side='left', padx=(4, 0))
+        self._lk(ttk.Button(r, text='選擇存放位置…', command=self.choose_out_location)).pack(side='left')
+        self._lk(ttk.Button(r, text='改回影片旁邊', command=self.reset_out_location)).pack(side='left', padx=(4, 0))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
         self.btn_cancel = ttk.Button(r, text='取消', width=6, command=self.cancel_run, state='disabled')
         self.btn_cancel.pack(side='right', fill='y', padx=(4, 0))
@@ -618,14 +630,18 @@ class App:
         self.update_out_location()
         self.pb = ttk.Progressbar(box, maximum=1000)
         self.pb.pack(fill='x', padx=6, pady=(6, 2))
+        # 判讀中鎖住第 1 頁時的說明（#98），平常不顯示
+        self.lbl_lock = ttk.Label(box, style='Warn.TLabel', justify='left', text=(
+            '判讀中：影片清單、監測站設定、參考線暫時不能修改（判讀完成或取消後恢復）。\n'
+            '要判讀下一批影片，請等這次完成；要放在同一份結果，請一次全部加入再判讀。'))
         self.var_status = tk.StringVar(value=STATUS_EMPTY)
         ttk.Label(box, textvariable=self.var_status, wraplength=330, style='Hint.TLabel').pack(fill='x', padx=6, pady=(0, 8))
 
         r = ttk.Frame(right); r.pack(fill='x')
         ttk.Label(r, text='在畫面上拖曳：').pack(side='left')
-        ttk.Radiobutton(r, text='參考線（紅）', value='ref', variable=self.mode).pack(side='left', padx=3)
-        ttk.Radiobutton(r, text='軌道範圍（橘）', value='track', variable=self.mode).pack(side='left', padx=3)
-        ttk.Radiobutton(r, text='時間字幕位置（藍）', value='osd', variable=self.mode).pack(side='left', padx=3)
+        self._lk(ttk.Radiobutton(r, text='參考線（紅）', value='ref', variable=self.mode)).pack(side='left', padx=3)
+        self._lk(ttk.Radiobutton(r, text='軌道範圍（橘）', value='track', variable=self.mode)).pack(side='left', padx=3)
+        self._lk(ttk.Radiobutton(r, text='時間字幕位置（藍）', value='osd', variable=self.mode)).pack(side='left', padx=3)
 
         self.cw, self.ch = CANVAS_W, CANVAS_H
         self.canvas = tk.Canvas(right, width=480, height=270, bg='#202020', highlightthickness=0, cursor='crosshair')
@@ -649,10 +665,10 @@ class App:
             ttk.Button(r, text=lab, width=7, command=lambda d=d: self.step(d)).pack(side='left', padx=(0, 4))
         ttk.Label(r, text='線寬').pack(side='left', padx=(10, 2))
         self.var_width = tk.IntVar(value=self.profile.ref_width)
-        sp = ttk.Spinbox(r, from_=3, to=25, width=4, textvariable=self.var_width, command=self.redraw_overlay)
+        sp = self._lk(ttk.Spinbox(r, from_=3, to=25, width=4, textvariable=self.var_width, command=self.redraw_overlay))
         sp.pack(side='left')
         sp.bind('<KeyRelease>', lambda e: self.redraw_overlay())
-        ttk.Button(r, text='教程式認字…', command=self.teach_osd).pack(side='right')
+        self._lk(ttk.Button(r, text='教程式認字…', command=self.teach_osd)).pack(side='right')
         r = ttk.Frame(right); r.pack(fill='x', pady=(4, 0))     # 時間判讀單獨一行，視窗窄時不會擠掉按鈕
         ttk.Label(r, text='畫面時間判讀：').pack(side='left')
         self.var_osd = tk.StringVar(value='')
@@ -1347,6 +1363,10 @@ class App:
     def on_press(self, e):
         if self.cur_frame is None:
             return
+        if self._run_lock_on:                  # 判讀中不能改參考線（#98）
+            self.drag = None
+            self.var_status.set('判讀中不能修改參考線、軌道範圍、時間字幕位置（判讀完成或取消後恢復）。')
+            return
         self.drag = self._to_video(e)
 
     def on_drag(self, e):
@@ -1478,6 +1498,8 @@ class App:
         self.cancel_flag = False
         self.run_t0 = time.time()
         self.btn_run.configure(state='disabled'); self.btn_cancel.configure(state='normal')
+        self._run_prof_name = prof.name
+        self._set_run_lock(True)
         self.pb['value'] = 0
         prof_copy = Profile.from_dict(json.loads(prof.to_json()))
         self.worker = threading.Thread(target=self._work, args=(files, manual, prof_copy, out), daemon=True)
@@ -1604,9 +1626,27 @@ class App:
             self.q.put(('error', '%s\n\n%s' % (e, traceback.format_exc())))
 
     def _poll(self):
+        """處理背景工作送來的訊息。任何一則處理失敗都不可以讓這個迴圈停掉（#97）：
+        以前只要一則出錯（例如確認視窗開不起來），之後的進度、確認、完成訊息就全部不再處理，
+        背景判讀卡在等使用者回答，畫面看起來像當掉。"""
         try:
             while True:
-                m = self.q.get_nowait()
+                try:
+                    m = self.q.get_nowait()
+                except queue.Empty:
+                    break
+                try:
+                    self._handle_msg(m)
+                except Exception:
+                    traceback.print_exc()
+                    try:
+                        self.var_status.set('程式內部發生錯誤（已略過，判讀繼續）：%s' % traceback.format_exc().strip().splitlines()[-1][:200])
+                    except Exception:
+                        pass
+        finally:
+            self.root.after(150, self._poll)
+
+    def _handle_msg(self, m):
                 kind = m[0]
                 if kind == 'prog':
                     self.pb['value'] = int(m[1] * 1000)
@@ -1658,39 +1698,21 @@ class App:
                     if self.scan_queue:
                         self._start_scanner()
                 elif kind == 'done':
-                    _, evs, out, files, timing, prof, cancelled = m
                     self._run_finished()
                     self.pb['value'] = 1000
-                    self.events, self.result_dir, self.run_files, self.run_timing, self.run_profile = evs, out, files, timing, prof
-                    self.set_dirty(False)       # 判讀完已自動輸出 Excel
-                    nv = sum(1 for e in evs if e['valid'])
-                    self.root.after(300, lambda evs=evs, c=cancelled, t=timing: self.show_summary(evs, c, t))
-                    stopped = any(t.get('warn') for t in timing)
-                    if stopped:
-                        self.var_status.set('⚠ 完成，但判讀途中攝影機位置或影片有狀況（見完成視窗）。\n列車%d筆、已排除%d筆。\n結果資料夾：%s'
-                                            % (nv, len(evs) - nv, os.path.basename(out)))
+                    if self.dirty:
+                        # 第 2 頁還有上一次結果沒儲存的修改：先問，不要默默蓋掉（#100）
+                        self.var_status.set('判讀完成。上一次的結果還有修改沒儲存，\n請在跳出的視窗選擇要不要儲存。')
+                        self._attention('第 2 頁的修改還沒儲存', lambda m=m: self._done_with_unsaved(m))
                     else:
-                        self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
-                            '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
-                    self.fill_events()
-                    self.nb.select(self.page2)
+                        self._apply_done(m)
                 elif kind == 'ask_pos':                         # 判讀前確認攝影機位置（#82）
                     _, need, prof, ev, ans = m
-                    ok = True
-                    for c in need:
-                        imgs = [('這批影片（%s）' % os.path.basename(c['file']), overlay_image(c['frame'], prof))]
-                        best = self._best_anchor_image(c, prof)
-                        if best is not None:
-                            imgs.insert(0, ('監測站儲存時的畫面', overlay_image(best, prof)))
-                        mv = c['verdict'] == 'moved'
-                        if not self.confirm('確認攝影機位置', position_check_text(c, c['verdict']),
-                                            ok='仍要判讀（全部標需確認）' if mv else '位置正確，開始判讀',
-                                            cancel='回去重設參考線' if mv else '取消', warn=mv, images=imgs):
-                            ok = False
-                            break
-                    ans['ok'] = ok
-                    ev.set()
+                    self._attention('確認攝影機位置', lambda: self._ask_pos(need, prof, ev, ans))
                 elif kind == 'anchors':                          # 使用者確認過的畫面記進監測站設定
+                    # 只記進這次判讀用的監測站（#99）：畫面上的監測站已經換成別的，就不要寫進去
+                    if getattr(self, '_run_prof_name', None) not in (None, self.profile.name):
+                        return
                     self.profile.camera_anchors = list(m[1])
                     self.profile.profile_version = 2
                     self._save_anchors_only(self.profile)
@@ -1700,14 +1722,158 @@ class App:
                     if getattr(self, '_made_root', None):          # 這次才建立的空「判讀結果」資料夾也收掉
                         self._remove_empty(self._made_root)
                     self.var_status.set('沒有開始判讀。')
-                    messagebox.showwarning(APP, m[1])
+                    self._attention('沒有開始判讀', lambda msg=m[1]: messagebox.showwarning(APP, msg))
                 elif kind == 'error':
                     self._run_finished()
                     self.var_status.set('發生錯誤，請看錯誤訊息。')
-                    messagebox.showerror(APP, '判讀時發生錯誤：\n' + m[1][:1500])
-        except queue.Empty:
+                    msg = '判讀時發生錯誤：\n' + m[1][:1500]
+                    self._attention('判讀時發生錯誤', lambda msg=msg: messagebox.showerror(APP, msg))
+
+    def _apply_done(self, m):
+        """判讀完成：把新結果放到第 2 頁"""
+        _, evs, out, files, timing, prof, cancelled = m
+        self.events, self.result_dir, self.run_files, self.run_timing, self.run_profile = evs, out, files, timing, prof
+        self.set_dirty(False)       # 判讀完已自動輸出 Excel
+        nv = sum(1 for e in evs if e['valid'])
+        self.root.after(300, lambda evs=evs, c=cancelled, t=timing:
+                        self._attention('判讀完成', lambda: self.show_summary(evs, c, t)))
+        stopped = any(t.get('warn') for t in timing)
+        if stopped:
+            self.var_status.set('⚠ 完成，但判讀途中攝影機位置或影片有狀況（見完成視窗）。\n列車%d筆、已排除%d筆。\n結果資料夾：%s'
+                                % (nv, len(evs) - nv, os.path.basename(out)))
+        else:
+            self.var_status.set('%s完成：列車 %d 筆、已排除 %d 筆。\n結果資料夾：%s' % (
+                '已取消，部分' if cancelled else '', nv, len(evs) - nv, os.path.basename(out)))
+        self.fill_events()
+        self.nb.select(self.page2)
+
+    def _done_with_unsaved(self, m):
+        """判讀完成時第 2 頁還有沒儲存的修改（#100）：先問要不要儲存，再換成新結果"""
+        while self.dirty:
+            # 預設（Enter、Esc、關掉視窗）都是「儲存」：按錯也不會把修改丟掉
+            if self.confirm('第 2 頁的修改還沒儲存',
+                            '判讀完成了，但第 2 頁還有上一次結果的修改沒有儲存：\n%s\n\n'
+                            '接下來第 2 頁會換成這次的新結果（新結果已經自動存好）。\n'
+                            '上一次的修改要先儲存嗎？' % (self.result_dir or ''),
+                            ok='不儲存，直接顯示新結果', cancel='儲存修改後再顯示新結果', warn=True):
+                break
+            self.save_results()                    # 失敗（例如 Excel 開著）會說明原因，修改仍在，再問一次
+        self._apply_done(m)
+
+    def _ask_pos(self, need, prof, ev, ans):
+        """判讀前確認攝影機位置（#82）。不論怎麼結束都一定 ev.set()，背景判讀才不會一直等（#97）"""
+        ok = False
+        try:
+            ok = True
+            for c in need:
+                imgs = [('這批影片（%s）' % os.path.basename(c['file']), overlay_image(c['frame'], prof))]
+                best = self._best_anchor_image(c, prof)
+                if best is not None:
+                    imgs.insert(0, ('監測站儲存時的畫面', overlay_image(best, prof)))
+                mv = c['verdict'] == 'moved'
+                if not self.confirm('確認攝影機位置', position_check_text(c, c['verdict']),
+                                    ok='仍要判讀（全部標需確認）' if mv else '位置正確，開始判讀',
+                                    cancel='回去重設參考線' if mv else '取消', warn=mv, images=imgs):
+                    ok = False
+                    break
+        finally:
+            ans['ok'] = ok
+            ev.set()
+
+    # ---------- 程式在背景時要跳出的視窗（#97） ----------
+    # 使用者切到其他程式（或把這個程式縮小）時跳出的確認視窗，在 Windows 上常常被藏在別的視窗後面、
+    # 或跟著縮小的主視窗一起被藏起來；切回來時只看到主視窗、看不到要回答的視窗，判讀就一直停在那裡。
+    # 改成：程式不在最前面時**先不開視窗**，在主視窗最上方顯示黃色提醒列＋「開啟確認視窗」按鈕，
+    # 工作列上的圖示會閃爍；使用者一回到這個程式就自動打開確認視窗（也可以直接按按鈕）。
+    # 程式本來就在最前面時，和以前一樣立刻跳出。
+
+    def _app_active(self):
+        """這個程式（任何一個視窗）是不是使用者現在正在用的前景程式。判斷不了時當作是（維持舊行為）"""
+        try:
+            if self.root.state() in ('iconic', 'withdrawn'):
+                return False
+            if sys.platform.startswith('win'):
+                import ctypes
+                u = ctypes.windll.user32
+                fg = u.GetForegroundWindow()
+                if not fg:
+                    return False
+                pid = ctypes.c_ulong(0)
+                u.GetWindowThreadProcessId(fg, ctypes.byref(pid))
+                return pid.value == os.getpid()
+            return True
+        except Exception:
+            return True
+
+    def _flash_taskbar(self):
+        """讓工作列上的程式圖示閃爍，直到使用者切回來（只有 Windows）"""
+        if not sys.platform.startswith('win'):
+            return
+        try:
+            import ctypes
+            from ctypes import wintypes
+
+            class FLASHWINFO(ctypes.Structure):
+                _fields_ = [('cbSize', wintypes.UINT), ('hwnd', wintypes.HWND), ('dwFlags', wintypes.DWORD),
+                            ('uCount', wintypes.UINT), ('dwTimeout', wintypes.DWORD)]
+            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id()) or self.root.winfo_id()
+            fi = FLASHWINFO(ctypes.sizeof(FLASHWINFO), hwnd, 0x3 | 0xC, 0, 0)   # FLASHW_ALL | FLASHW_TIMERNOFG
+            ctypes.windll.user32.FlashWindowEx(ctypes.byref(fi))
+        except Exception:
             pass
-        self.root.after(150, self._poll)
+
+    def _attention(self, label, fn):
+        """要跳出視窗請使用者看／回答時都經過這裡：程式在前面就立刻開，不在前面就排隊等使用者回來"""
+        self._attn_pending.append((label, fn))
+        if not self._attn_running and self._app_active():
+            self._attn_run_next()
+            return
+        self._attn_update_bar()
+        self._flash_taskbar()
+        if self._attn_job is None:
+            self._attn_job = self.root.after(400, self._attn_check)
+
+    def _attn_update_bar(self):
+        if not self._attn_pending:
+            self.attn_bar.pack_forget()
+            return
+        labels = '、'.join(dict.fromkeys(l for l, _f in self._attn_pending))
+        self.var_attn.set('⚠ 程式需要您處理：%s\n請按右邊的「開啟確認視窗」（回到這個程式畫面時也會自動打開）。' % labels)
+        if not self.attn_bar.winfo_ismapped():
+            self.attn_bar.pack(side='top', fill='x', padx=6, pady=(6, 0), before=self.nb)
+
+    def _attn_check(self):
+        self._attn_job = None
+        if not self._attn_pending:
+            self._attn_update_bar()
+            return
+        if not self._attn_running and self._app_active():
+            self._attn_run_next()
+        if self._attn_pending:
+            self._attn_job = self.root.after(400, self._attn_check)
+
+    def _attn_open_now(self):
+        """提醒列上的按鈕：直接打開（使用者按得到按鈕，表示人就在這個程式上）"""
+        if not self._attn_running and self._attn_pending:
+            self._attn_run_next()
+
+    def _attn_run_next(self):
+        """依序打開排隊的視窗；一個關掉才開下一個。出錯也不會卡住後面的"""
+        while self._attn_pending and not self._attn_running:
+            label, fn = self._attn_pending.pop(0)
+            self._attn_update_bar()
+            self._attn_running = True
+            try:
+                fn()
+            except Exception:
+                traceback.print_exc()
+                try:
+                    messagebox.showerror(APP, '開啟「%s」視窗時發生錯誤：\n%s' % (label, traceback.format_exc()[-800:]))
+                except Exception:
+                    pass
+            finally:
+                self._attn_running = False
+        self._attn_update_bar()
 
     def _save_anchors_only(self, p):
         """只把位置基準寫回已儲存的監測站設定檔（其他還沒儲存的修改不動）。
@@ -1747,6 +1913,36 @@ class App:
 
     def _run_finished(self):
         self.btn_run.configure(state='normal'); self.btn_cancel.configure(state='disabled')
+        self._set_run_lock(False)
+
+    def _lk(self, w):
+        """登記一個判讀中要鎖住的控制項（#98），回傳原控制項"""
+        self._run_locked.append(w)
+        return w
+
+    def _set_run_lock(self, on):
+        """判讀中鎖住第 1 頁會改到這次判讀的控制項（#98）：影片清單、監測站設定、參考線、存放位置。
+        以前判讀中只有「開始判讀」按不下去：新加入的影片會在背景讀畫面時間、拖慢判讀；
+        換監測站的話，判讀前確認過的攝影機位置會被存到換過去的那個監測站（#99）。"""
+        self._run_lock_on = bool(on)
+        for w in self._run_locked:
+            try:
+                if on:
+                    if not hasattr(w, '_tw_state'):
+                        w._tw_state = str(w.cget('state'))
+                    w.configure(state='disabled')
+                elif hasattr(w, '_tw_state'):
+                    w.configure(state=w._tw_state)
+                    del w._tw_state
+            except tk.TclError:
+                pass
+        try:
+            if on:
+                self.lbl_lock.pack(fill='x', padx=6, pady=(2, 4), after=self.pb)
+            else:
+                self.lbl_lock.pack_forget()
+        except (tk.TclError, AttributeError):
+            pass
 
     # ------------------------------------------------------------ 結果存放位置
     def update_out_location(self):
@@ -2206,6 +2402,14 @@ class App:
     def confirm(self, title, msg, ok='確定', cancel='取消', warn=False, icon=None, images=None):
         """自訂確認視窗（按鈕文字固定是中文，不受作業系統語言影響）。確定→True，取消／關掉視窗→False。
         cancel=None：只有一個按鈕（通知用）"""
+        # 主視窗縮小時先把它叫回來，再建立視窗（#74、#97）：transient 視窗建立時會跟著主視窗的狀態，
+        # 主視窗還是縮小的話，這個視窗一出生就被藏起來
+        try:
+            if self.root.state() in ('iconic', 'withdrawn'):
+                self.root.deiconify()
+                self.root.update_idletasks()
+        except tk.TclError:
+            pass
         w = tk.Toplevel(self.root)
         w.title(title)
         w.transient(self.root)
@@ -2249,6 +2453,7 @@ class App:
         try:
             if self.root.state() in ('iconic', 'withdrawn'):
                 self.root.deiconify()
+            w.deiconify()                              # 被跟著主視窗藏起來的話，叫出來（#97）
             w.lift()
             w.attributes('-topmost', True)
             w.after(400, lambda: w.winfo_exists() and w.attributes('-topmost', False))
@@ -2258,7 +2463,16 @@ class App:
         bring = lambda e=None: (w.winfo_exists() and (w.lift(), w.focus_force()))
         bid = self.root.bind('<FocusIn>', bring, add='+')
         bid2 = self.root.bind('<Map>', bring, add='+')
-        w.grab_set()
+
+        def grab():
+            # 視窗還沒真的顯示出來時 grab_set 會丟 TclError（grab failed: window not viewable）；
+            # 以前這個錯誤直接讓確認流程中斷、背景判讀一直等（#97）。等它顯示出來再抓
+            try:
+                w.grab_set()
+            except tk.TclError:
+                if w.winfo_exists():
+                    w.after(150, grab)
+        grab()
         self.root.wait_window(w)
         for seq, b_ in (('<FocusIn>', bid), ('<Map>', bid2)):
             try:

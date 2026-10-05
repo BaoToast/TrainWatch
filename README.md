@@ -88,6 +88,8 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 
 ## 監測站的攝影機位置基準、幾何位置（v1.0.13，修正清單 #82～#87）
 
+- v1.0.15（#97）：程式不在最前面（切到其他視窗、縮小）時要跳出的視窗——判讀前確認攝影機位置、判讀完成摘要、沒有開始判讀、判讀錯誤——改經 `_attention()` 排隊：程式在前景（Windows 用 `GetForegroundWindow` 的行程編號比對）就立刻開；不在前景就在主視窗最上方顯示黃色提醒列＋「開啟確認視窗」按鈕、工作列圖示閃爍（`FlashWindowEx`），使用者回到程式時自動打開。`_poll()` 每則訊息個別 try，一則出錯不再讓整個訊息迴圈停掉；`confirm()` 先叫回縮小的主視窗再建立視窗，`grab_set` 失敗（視窗還沒顯示）會重試；`_ask_pos()` 不論怎麼結束都通知背景判讀。
+- v1.0.15（#98～#100）：判讀中 `_set_run_lock(True)` 停用第 1 頁會改到這次判讀的控制項（`_lk()` 登記：影片清單、監測站、參考線、存放位置等），畫布拖曳也不接受；`_run_finished()` 恢復原本狀態（下拉選單回唯讀）。`anchors` 訊息只寫進這次判讀用的監測站（`_run_prof_name`）。判讀完成時第 2 頁還有沒儲存的修改：`_done_with_unsaved()` 先問（Enter／Esc／關視窗＝儲存），再 `_apply_done()` 換成新結果。兩次判讀的結果不合併（使用者決定）。
 - v1.0.14（#89～#96）：儲存監測站用 `plan_anchor_save()`：沒有舊基準或參考線重畫過＝new；參考線沒改時先比對，same＝照存（`add_anchor(…, profile)` 去重：同位置、符合點 ≥ 160、彩度差 < 10 就不重複加），moved＝**不加**、跳出提醒（其他設定照存），uncertain＝使用者確認才加。時間字幕遮罩改用 `osd_box(profile)`（`osd_rect` ±8 像素，另外照舊遮上方 40 像素），用在 `_geo_mask`、`CameraGuard._mask`、`_exposure_calc`。慢慢轉動 3 度、變焦 4%、每次都換比較畫面時，累積偏移和真正的差 ≤ 0.43 像素，所以維持「偏移相加」不改矩陣相乘（test94a／94b）。
 
 - 儲存監測站時，用畫參考線的那個畫面存一張位置基準（`Profile.camera_anchors`，灰階 JPEG base64，最多 8 張，第一張保留）。`profile_version`＝2；沒有這個欄位的＝1（舊版）。results.json 只記張數（`camera_anchor_count`），另記 `app_version`。
