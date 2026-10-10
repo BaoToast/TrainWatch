@@ -1408,3 +1408,122 @@ for _cls, _names in SLOW_TESTS.items():
         setattr(_c, _n, unittest.skipIf(_SKIP_SLOW, '打包時略過（花時間長，交付前已在開發環境全部跑過）')(getattr(_c, _n)))
 
 del _cls, _names, _n, _c
+
+
+class TestRound10(unittest.TestCase):
+    """v1.0.16：使用者一整天真實影片回報的問題（修正清單 #101～#103）"""
+    scene = TestRound2.scene
+    run_files = TestRound2.run_files
+    valid = TestRound2.valid
+
+    def test101_ir_switch_hours_later(self):
+        """#101 判讀很久之後（開頭 90 秒背景取樣以後）攝影機才切換成紅外線：
+        v1.0.15 背景不會跟著換，變成一筆持續到影片結束的「列車」，之後的列車全部漏掉"""
+        d, f, exp = self.scene('a.avi', 200, ir_at=130, ir_mix=True, trains=[dict(t0=30, d=1), dict(t0=170, d=-1)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 2, [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason']) for e in evs])
+        for g, x in zip(v, exp):
+            self.assertLess(abs(g['start'] - x[0]), 0.5, (g['start'], x))
+            self.assertLess(abs(g['end'] - x[1]), 0.6, (g['end'], x))
+        self.assertTrue(all(e['end'] - e['start'] < 20 for e in evs), [(e['start'], e['end']) for e in evs])
+
+    def test101b_ir_switch_during_train(self):
+        """#101 列車經過時剛好切換：那一筆在切換那一刻結束、標車尾未確認；切換後的列車照常判讀"""
+        d, f, exp = self.scene('a.avi', 200, ir_at=131, ir_mix=True, trains=[dict(t0=130, d=1, speed=40, length=400), dict(t0=170, d=-1)])
+        evs, _ = self.run_files([f], [0.0])
+        v = self.valid(evs)
+        self.assertEqual(len(v), 2, [(round(e['start'], 1), round(e['end'], 1), e['valid'], e['reason']) for e in evs])
+        self.assertTrue(v[0]['need_check'])
+        self.assertIn('切換', v[0]['reason'])
+        self.assertLess(abs(v[0]['start'] - exp[0][0]), 0.5)
+        self.assertLess(abs(v[1]['start'] - exp[1][0]), 0.5, [(round(e['start'], 1), e['valid'], e['reason'][:40]) for e in evs])
+        self.assertTrue(all(e['end'] - e['start'] < 20 for e in evs), [(e['start'], e['end']) for e in evs])
+
+    def test101c_switch_back_to_day(self):
+        """#101 清晨從紅外線切回彩色也一樣（模式判斷兩個方向都要）"""
+        prof = core.Profile()
+        det = core.Detector(prof, core.work_crop(prof, 640, 360))
+        det.mode = 'night'
+        self.assertTrue(det._mode_check(100.0, 60.0, 'x.mkv', 1.0))
+        self.assertEqual(det.mode, 'day')
+        self.assertFalse(det._mode_check(100.1, 0.0 + 20.0, 'x.mkv', 1.1))     # 介於中間（彩度 8～25）不算切換
+
+
+def _must_have():
+    root = os.environ.get('TW_SAMPLES')
+    p = os.path.join(root, 'must_have.json') if root else ''
+    return p if p and os.path.exists(p) else None
+
+
+@unittest.skipUnless(_must_have(), '沒有設定 TW_SAMPLES，或樣本資料夾裡沒有 must_have.json')
+class TestMustHave(unittest.TestCase):
+    """樣本資料夾的 must_have.json：v1.0.15 漏判或判錯、逐格看過畫面確認的列車（#101～#103）。
+    每一列一定要判讀成「是列車」（可以標需確認），車頭、車尾和逐格看到的時間差 1 秒以內；max_len：不可以有比這更長的一筆。
+    格式：[{"files": ["檔名開頭", …], "trains": [["時:分:秒.x", "時:分:秒.x"], …], "max_len": 秒數（可省略）}]
+    影片與答案都是真實監測資料，不放進 repository。"""
+    def test_must_have(self):
+        import json
+        root = os.environ['TW_SAMPLES']
+        with open(_must_have(), encoding='utf-8') as fh:
+            cases = json.load(fh)
+
+        def sec(s):
+            h, m, x = s.split(':')
+            return int(h) * 3600 + int(m) * 60 + float(x)
+        for case in cases:
+            files = [glob.glob(os.path.join(root, k + '*'))[0] for k in case['files']]
+            bases = [osd.calibrate(f, osd.DEFAULT_RECT)['offset'] for f in files]
+            evs = core.number_events(core.process(files, bases, core.Profile()))
+            got = [(sec(core.fmt_time(e['start'])), sec(core.fmt_time(e['end']))) for e in evs if e['valid']]
+            for a, b in case['trains']:
+                hit = [g for g in got if abs(g[0] - sec(a)) < 1.0 and abs(g[1] - sec(b)) < 1.0]
+                self.assertTrue(hit, (case['files'], a, b, [(core.fmt_time(e['start']), core.fmt_time(e['end']), e['valid'], e['reason'][:40]) for e in evs]))
+            if case.get('max_len'):
+                self.assertTrue(all(e['end'] - e['start'] < case['max_len'] for e in evs),
+                                [(core.fmt_time(e['start']), core.fmt_time(e['end'])) for e in evs])
+
+
+class TestRound10b(unittest.TestCase):
+    """#104 換比較畫面時的量測誤差一直累積，誤報攝影機慢慢偏移"""
+    def run_guard(self, steps):
+        """steps：每次比對（每 GEO_STEP 秒）量到相對目前比較畫面的位移（像素，整體平移）與符合的點數"""
+        p = core.Profile()
+        g = core.CameraGuard(p)
+        k = len(core.geo_points(p))
+        g.home, g.home_off, g.geo_ok_t, g.geo_off = 'home', np.zeros((k, 2), np.float32), 0.0, np.zeros((k, 2), np.float32)
+        seq = iter(steps)
+        old_f, old_c = core.geo_features, core.geo_compare
+        hits = []
+        try:
+            core.geo_features = lambda fr, prof: 'F'
+
+            def fake(a, b, prof):
+                dx, n = next(seq)
+                return dict(n=n, off=np.tile(np.float32([[dx, 0.0]]), (k, 1)))
+            core.geo_compare = fake
+            for i in range(len(steps)):
+                t = (i + 1) * core.GEO_STEP
+                h = g._geo(t, None, 'x.mkv', t)
+                if h:
+                    hits.append(h)
+        finally:
+            core.geo_features, core.geo_compare = old_f, old_c
+        return hits, core.geo_disp(g.geo_off)
+
+    def test104a_small_errors_do_not_add_up(self):
+        """一整天換 8 次比較畫面，每次都量到 1 像素的誤差（符合的點少）：v1.0.16 以前會累積到 8 像素、誤報慢慢偏移"""
+        hits, disp = self.run_guard([(1.0, 60)] * 8)
+        self.assertEqual(hits, [])
+        self.assertLess(disp, core.GEO_SAME)
+
+    def test104b_real_moves_still_add_up(self):
+        """真的移動（每次 4 像素）照樣累積，兩次就超過 6 像素 → 要報"""
+        hits, disp = self.run_guard([(4.0, 60), (4.0, 60), (0.0, 500), (0.0, 500)])
+        self.assertTrue(hits)
+        self.assertEqual(hits[0][3], 'drift')
+
+    def test104c_drift_inside_one_home_still_detected(self):
+        """同一個比較畫面裡慢慢偏移（符合的點多，不換比較畫面）：照樣直接量到、要報"""
+        hits, disp = self.run_guard([(2.0, 500), (4.0, 500), (6.5, 500), (7.0, 500)])
+        self.assertTrue(hits)

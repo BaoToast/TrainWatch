@@ -44,8 +44,12 @@ class Profile:
     off_level: float = 10.0               # 低於 → 視為沒有佔用（遲滯）
     pixel_diff: float = 25.0              # 單一像素和背景差多少算「有變化」
     merge_gap: float = 1.0                # 佔用中斷少於幾秒視為同一筆（車廂之間的空隙）
+    light_cross_cov: float = 0.15         # 軌道範圍內變化比例達到這個、且參考線兩側都有變化：相似度要 ≥ light_cross_ncc 才當成光線變化（#102）
+    light_cross_ncc: float = 0.85
     min_duration: float = 0.6             # 少於幾秒視為閃爍（排除，列在「已排除」）
     min_coverage: float = 0.25            # 軌道範圍覆蓋率最大值低於此值 → 非列車（排除）
+    low_coverage: float = 0.15            # 變化範圍在 low_coverage～min_coverage 之間、時間 ≥ low_coverage_sec、兩側都有：算列車但要確認（#103）
+    low_coverage_sec: float = 4.0
     min_both: float = 0.15                # 參考線左右兩側「同時」都被擋住的比例最大值低於此值 → 非列車（車燈照射、路上的車）
     long_event: float = 600.0             # 超過幾秒只標記「需人工確認」（不會因此結束，也不會重學背景）
     static_motion: float = 2.5            # 參考線上前後兩格的變化小於此值 → 視為畫面靜止（列車停住）
@@ -112,6 +116,7 @@ GEO_STEP = 30.0       # 判讀途中每幾秒比一次（一次約 50 毫秒，2
 GEO_OK = 40           # 符合的特徵點至少幾個才算比得起來
 GEO_REHOME = 80       # 少於這個數（光線慢慢改變）就換新的比較畫面，累積的偏移量保留（不會歸零）
 GEO_SAME = 3.0        # 偏移小於幾像素＝位置相同
+GEO_RELIABLE = 80     # 符合的點少於這個數時，量到的偏移可能有 0.2～2 像素誤差（實測，#104）
 GEO_MOVE = 6.0        # 偏移幾像素以上＝移動。依真實樣本的量測穩定度訂（同一位置偏移 < 1 像素）；實際會造成多少
                       # 時間誤差，要看列車速度與畫面幾何（慢車、停車再開時誤差較大），不能固定換算成秒數（#93）
 GEO_STALE = 300.0     # 判讀途中超過幾秒都比不起來（也比不上監測站基準）→ 記下「無法確認位置」，之後的列車標需確認（#84、#88）
@@ -448,6 +453,12 @@ class CameraGuard:
         if res is not None:
             total = self.home_off + res['off']
             if res['n'] < GEO_REHOME:               # 光線慢慢改變：換新的比較畫面，偏移量保留
+                # 換比較畫面的時候正是比得最勉強的時候（符合的點少），量到的偏移常有 0.2～2 像素的誤差；
+                # 以前每換一次就把這個誤差加進累積偏移，一整天換 7 次累積到 6 像素，誤報「慢慢偏移」（#104，實測攝影機沒動）。
+                # 符合的點少（< GEO_RELIABLE）、這一步量到的偏移又小於 GEO_SAME（＝位置相同）時當成量測誤差，不加進去；
+                # 真的移動（≥ GEO_SAME）、或符合的點夠多（量得準，例如慢慢轉動、變焦，#94）照樣累積
+                if res['n'] < GEO_RELIABLE and geo_disp(res['off']) < GEO_SAME:
+                    total = self.home_off
                 self.home, self.home_off = F, total
         else:
             res, _ = best_anchor(F, self.anchors, self.p)
@@ -598,6 +609,8 @@ class Detector:
         self.camera_events = []  # 攝影機位置有問題的時間點（#88：不停止判讀，之後的列車標需確認）
         self.errors = []         # 判讀途中出錯（#87、#88：跳過那支影片剩下的部分，繼續下一支）
         self.warm = None         # 攝影機突然移動後重新認識背景：暫存這段畫面，背景建好後再補判讀（#88）
+        self.mode = None         # 攝影機的日夜模式：'day'（彩色）／'night'（紅外線黑白）。切換時整個畫面突然改變（#101）
+        self.mode_events = []
         self.small = self.bg_small = self.out_mask = None   # 整個畫面縮小版（估計攝影機自動調亮度）
 
     def feed(self, t_abs: float, gray: np.ndarray, sat: float, file: str, pos: float, frame_bgr=None):
@@ -611,6 +624,9 @@ class Detector:
         if gain != 1.0:
             g = g / gain        # 攝影機自動調亮度（例如亮的列車經過後整個畫面變暗）→ 先還原再比較
         if self.warm is not None:
+            self._warm_feed(t_abs, gray, sat, file, pos)
+            return
+        if self._mode_check(t_abs, sat, file, pos):
             self._warm_feed(t_abs, gray, sat, file, pos)
             return
         if self._camera_check(t_abs, g, gain, file, pos):
@@ -643,11 +659,17 @@ class Detector:
         # 白天：亮度差很多、但紋理和背景幾乎一樣（地上的東西都還在原位，只是被陽光照亮或雲遮暗）→ 不算有車。
         # 夜間（紅外線黑白畫面）列車被車燈照白時紋理相似度也很高，所以只在白天用。
         light = False
+        # 有東西橫跨參考線（軌道範圍內有一定比例的變化，而且參考線兩側都有）時不算光線變化（#102）：
+        # 實測白天列車被遠處的樹與電線桿擋住一部分時，參考線帶狀區的紋理相似度也會超過 light_ncc，
+        # 被當成「陽光」而不算佔用，還把列車學成背景，列車只剩 0.1～0.3 秒（被排除）或整筆漏掉。
+        # 但紋理幾乎完全一樣（相似度 ≥ light_cross_ncc）時，即使大範圍變亮變暗，仍是光線變化（整片雲影、假影片的陽光約 0.99；
+        # 實測被遮住一部分的列車最高 0.73）
+        crossing = cov >= self.p.light_cross_cov and both >= self.p.min_both
         if sat >= self.p.day_saturation and score > self.p.off_level:
             u = g[self.band]; v = self.bg[self.band]
             u = u - u.mean(); v = v - v.mean()
             ncc = float((u * v).sum() / np.sqrt((u * u).sum() * (v * v).sum() + 1e-6))
-            light = ncc > self.p.light_ncc
+            light = ncc > (self.p.light_cross_ncc if crossing else self.p.light_ncc)
         if light:
             on = occupied = False
             if self.light_since is None:
@@ -756,6 +778,36 @@ class Detector:
         return True
 
     WARM = 10.0       # 攝影機突然移動後，用幾秒的畫面重新建立列車背景
+    NIGHT_SAT = 8.0   # 彩度低於這個＝紅外線黑白（實測夜間 0.0、壓縮過的黑白假影片約 3～5；白天 25 以上）
+    MODE_SETTLE = 6.0  # 切換日夜模式後，攝影機自動調整亮度的時間（實測約 5 秒；這段開始的變化當成排除，留給使用者看）
+    MODE_WARM = 40.0   # 切換日夜模式後用幾秒的畫面重建背景（取中位數：切換時剛好有列車經過，列車也不會被學進背景）
+
+    def _mode_check(self, t_abs, sat, file, pos):
+        """攝影機在傍晚切換成紅外線黑白（清晨切回彩色）時，整個畫面一瞬間改變（實測彩度 85 → 0、亮度 102 → 178）。
+        以前背景不會跟著換，參考線上的差異一直降不下來，變成一筆持續到最後一支影片的「列車」，之後的列車全部漏掉（#101）。
+        切換時：進行中的那一筆在切換那一刻結束（切換那一刻才開始的不是列車），
+        再用接下來 MODE_WARM 秒的畫面重新建立背景，背景建好後補判讀這段畫面（不會漏掉這段時間的列車）。回傳 True＝開始重新建立背景"""
+        mode = 'day' if sat >= self.p.day_saturation else ('night' if sat < self.NIGHT_SAT else None)
+        if mode is None:
+            return False
+        old, self.mode = self.mode, mode
+        if old is None or old == mode:
+            return False
+        name = '夜間（紅外線黑白）' if mode == 'night' else '白天（彩色）'
+        self.mode_events.append(dict(t=t_abs, file=file, pos=pos, mode=mode))
+        self.mode_t = t_abs
+        self.guard.notes.append(dict(file=file, t=t_abs, text='%s：攝影機切換成%s模式（%s），已重新建立背景'
+                               % (fmt_time(t_abs), name, os.path.basename(file or ''))))
+        if self.cur is not None:
+            c = self.cur
+            if c['end'] > t_abs:
+                c['end'], c['end_file'], c['end_pos'] = t_abs, file, pos
+            c['mode_start'] = c['start'] >= t_abs - 1.0          # 切換那一刻才開始的：不是列車
+            c['mode_t'], c['mode_name'] = t_abs, name
+            self.pending_close = None
+            self.finish('mode')
+        self.warm = dict(until=t_abs + self.MODE_WARM, buf=[], kind='mode')
+        return True
 
     def _warm_feed(self, t_abs, gray, sat, file, pos):
         self.warm['buf'].append((t_abs, gray, sat, file, pos))
@@ -772,7 +824,7 @@ class Detector:
             return
         step = max(1, len(w['buf']) // 21)
         bg = np.median(np.stack([x[1].astype(np.float32) for x in w['buf'][::step]]), axis=0).astype(np.float32)
-        self.restart(bg, '', kind='camera')
+        self.restart(bg, '', kind=w.get('kind', 'camera'))
         for t, gr, st, fl, ps in w['buf']:            # 補判讀這段畫面（沒有彩色畫面：不估計自動調亮度、不比對攝影機位置）
             self.feed(t, gr, st, fl, ps, None)
 
@@ -932,6 +984,12 @@ class Detector:
         if dur < self.p.min_duration:
             ev['valid'] = False
             reasons.append('時間太短（%.1f 秒，可能是閃爍或畫面亮度跳動）' % dur)
+        elif (c['coverage'] < self.p.min_coverage and c['coverage'] >= self.p.low_coverage
+              and c.get('both', 0.0) >= self.p.min_both and dur >= self.p.low_coverage_sec):
+            # 遠側軌道的列車被前面的樹叢擋住一半，變化範圍只有 20～24%（#103）：時間夠長、參考線兩側都有變化 → 算列車但要確認
+            ev['need_check'] = True
+            reasons.append('軌道範圍內變化範圍偏小（%.0f%%），可能是被樹擋住的遠側列車，也可能是路上的大型車，請確認' % (c['coverage'] * 100))
+            items.append('變化範圍偏小（可能被遮住）')
         elif c['coverage'] < self.p.min_coverage:
             ev['valid'] = False
             reasons.append('軌道範圍內變化範圍太小（%.0f%%，可能是汽車、行人或樹葉）' % (c['coverage'] * 100))
@@ -941,6 +999,9 @@ class Detector:
         if c.get('incomplete'):
             ev['end_known'] = False
         ev['start_known'] = not c.get('at_file_start')
+        if c.get('mode_start'):
+            ev['valid'] = False
+            reasons.insert(0, '攝影機在 %s 切換成%s模式，這一筆是畫面突然改變造成的，不是列車' % (fmt_time(c['mode_t']), c['mode_name']))
         if c.get('camera_start'):
             ev['valid'] = False
             reasons.insert(0, '攝影機位置在 %s 改變（可能被碰到或轉動），這一筆是畫面改變造成的，不是列車'
@@ -957,6 +1018,10 @@ class Detector:
                 reasons.append('車尾未確認：車尾看起來在 %s 離開，但還沒等滿確認時間（%g 秒，用來排除車廂之間的空隙）%s'
                                % (fmt_time(c['end']), wait, when))
                 items.append('車尾離開後確認時間不足（車尾未確認）')
+            elif c.get('incomplete') == 'mode':
+                ev['need_check'] = True
+                reasons.append('車尾未確認：攝影機在 %s 切換成%s模式，畫面突然改變，車尾時間無法確認' % (fmt_time(c['mode_t']), c['mode_name']))
+                items.append('攝影機切換日夜模式（車尾未確認）')
             elif c.get('incomplete') == 'camera':
                 ev['need_check'] = True
                 reasons.append('車尾未確認：攝影機位置在 %s 突然改變（可能被碰到），車尾時間無法確認' % fmt_time(c['camera_t']))
@@ -996,7 +1061,16 @@ class Detector:
             if eshift > 0:
                 reasons.append('參考線到 %s 還有微小變化（可能是車尾後光線或背景改變），車尾時間取變化明顯的時刻（往前 %.1f 秒）'
                                % (fmt_time(last_change), eshift))
-            if c.get('at_file_start') == 'camera':
+            if c.get('at_file_start') == 'mode' and c['start'] - getattr(self, 'mode_t', -1e9) < self.MODE_SETTLE:
+                # 切換後幾秒攝影機還在自動調整亮度（實測 178 → 140），畫面一直變：當成排除，留給使用者看
+                ev['valid'] = False
+                reasons.insert(0, '攝影機剛切換日夜模式（%s），前 %g 秒畫面還在自動調整亮度，這一筆可能只是亮度變化；若確實是列車，請改成「是列車」'
+                               % (fmt_time(self.mode_t), self.MODE_SETTLE))
+            elif c.get('at_file_start') == 'mode':
+                ev['need_check'] = True
+                reasons.append('攝影機切換日夜模式、重新建立背景時，參考線上已經有變化（車頭時間可能不準）')
+                items.append('攝影機切換日夜模式時已有列車（車頭未確認）')
+            elif c.get('at_file_start') == 'camera':
                 ev['need_check'] = True
                 reasons.append('攝影機位置改變、重新認識背景時，參考線上已經有變化（車頭時間可能不準）')
                 items.append('攝影機位置改變時已有列車（車頭未確認）')

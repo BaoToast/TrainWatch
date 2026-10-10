@@ -50,7 +50,7 @@ def make_video(path, seconds=40.0, trains=((5.0, +1), (22.0, -1)), speed=120.0, 
 
 
 def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), seed=2, vertical=False, ir_at=None, camera_shift=None, texture=400,
-               cam_path=None):
+               cam_path=None, ir_mix=False):
     """較完整的假影片（驗收測試用）。
     trains：dict(t0=車頭碰到參考線 x=350 的秒數, d=+1 往右／-1 往左, speed=像素／秒, length=車長像素,
                  y=(上, 下), stops=[(開始停的秒數, 停多久), …], car=每節車廂長, gap=車廂間空隙像素)
@@ -59,6 +59,7 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), 
     local_light：[(開始秒, 結束秒, 亮度倍率)]（只有軌道一帶 y=140～240 變亮／變暗，模擬陽光、雲影；過渡 2 秒）
     vertical：True＝整個畫面轉 90 度（360×640，軌道上下走向，列車往下／往上；設定用 VERTICAL_PROFILE）
     ir_at：從這一秒起畫面變成紅外線模式（黑白、對比和亮度都不同），模擬傍晚攝影機切換
+    ir_mix：紅外線模式時各顏色的亮度不是同一個倍率（真實攝影機：樹葉變很亮、其他東西不一定），整體亮度修正還原不了（#101）
     camera_shift：(秒, dx, dy, 轉幾度)，從這一秒起整個畫面移動／轉動，模擬攝影機被碰歪
     texture：背景上的圓點數（越多紋理越密，像真實的樹叢、電線桿）
     cam_path：[(秒, dx, dy, 轉幾度, 縮放), …]，攝影機位置隨時間慢慢改變（中間線性內插；轉動、縮放可省略），
@@ -119,8 +120,12 @@ def make_scene(path, seconds, trains=(), exposure=(), blobs=(), local_light=(), 
         out = fr.astype(np.float32) * f + rng.normal(0, 2.5, fr.shape)
         out = np.clip(out, 0, 255).astype(np.uint8)
         if ir_at is not None and t >= ir_at:
-            g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
-            g = np.clip((g - 110) * 1.6 + 150, 0, 255).astype(np.uint8)     # 紅外線：黑白、比較亮、對比不同
+            if ir_mix:
+                o = out.astype(np.float32)
+                g = np.clip(0.9 * o[:, :, 1] + 0.5 * o[:, :, 2] - 0.4 * o[:, :, 0] + 40, 0, 255).astype(np.uint8)
+            else:
+                g = cv2.cvtColor(out, cv2.COLOR_BGR2GRAY).astype(np.float32)
+                g = np.clip((g - 110) * 1.6 + 150, 0, 255).astype(np.uint8)     # 紅外線：黑白、比較亮、對比不同
             out = cv2.cvtColor(g, cv2.COLOR_GRAY2BGR)
         if camera_shift is not None and t >= camera_shift[0]:
             _t, dx, dy, ang = camera_shift
