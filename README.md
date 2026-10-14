@@ -88,6 +88,7 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 
 ## 監測站的攝影機位置基準、幾何位置（v1.0.13，修正清單 #82～#87）
 
+- v1.0.18（#105、#106）：第 2 頁清單加「勾選」欄（`pick` 欄、`e['_pick']` 只在記憶體，`export.clean()` 白名單不會存）與 `batch_valid()`：一次改為列車／不是列車，**不補做短片**。第 1 頁「產生：截圖＋短片／只要截圖／都不要」→ `Profile.make_clips`／`make_shots`（開始判讀時依選擇設定；選擇記在設定資料夾 `_產生截圖短片.txt`）；`save_frames_and_clips()` 兩個都 False 時直接返回、不讀影片；`regen_media()` 依結果的設定，都不要時不產生。
 - v1.0.17（#104）：幾何位置換比較畫面時，符合點 < `GEO_RELIABLE` 且那一步量到 < `GEO_SAME` 的偏移當成量測誤差不累積（一整天換 7 次比較畫面，誤差累積到 6 像素，誤報慢慢偏移）。
 - v1.0.16（#101～#103，使用者一整天的真實影片重跑發現）：`Detector._mode_check()` 偵測日夜模式切換（彩度 ≥ `day_saturation`＝白天、< `NIGHT_SAT`(8)＝紅外線），切換時結束進行中的那一筆（`mode_start`／`incomplete='mode'`），用 `MODE_WARM`(40) 秒畫面的中位數重建背景後補判讀；切換後 `MODE_SETTLE`(6) 秒內開始的列為排除。白天光線規則（NCC）在 `cov ≥ light_cross_cov` 且 `both ≥ min_both` 時不套用（實測被樹遮住一部分的列車 NCC 也會 > 0.45）。覆蓋率 `low_coverage`～`min_coverage` 且兩側都有、≥ `low_coverage_sec` 秒＝列車但需確認。真實影片回歸：`TW_SAMPLES` 資料夾的 `must_have.json`（`TestMustHave`）。
 - v1.0.15（#97）：程式不在最前面（切到其他視窗、縮小）時要跳出的視窗——判讀前確認攝影機位置、判讀完成摘要、沒有開始判讀、判讀錯誤——改經 `_attention()` 排隊：程式在前景（Windows 用 `GetForegroundWindow` 的行程編號比對）就立刻開；不在前景就在主視窗最上方顯示黃色提醒列＋「開啟確認視窗」按鈕、工作列圖示閃爍（`FlashWindowEx`），使用者回到程式時自動打開。`_poll()` 每則訊息個別 try，一則出錯不再讓整個訊息迴圈停掉；`confirm()` 先叫回縮小的主視窗再建立視窗，`grab_set` 失敗（視窗還沒顯示）會重試；`_ask_pos()` 不論怎麼結束都通知背景判讀。

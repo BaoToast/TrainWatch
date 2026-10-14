@@ -350,6 +350,31 @@ class TestRound2(unittest.TestCase):
         self.assertLess(abs(sec - 26), 1.0, sec)
         self.assertEqual(len(v[0]['shots']), 3)
 
+    def test106_media_choice(self):
+        """#106 判讀前選擇產生內容：截圖＋短片／只要截圖／都不要（都不要時不再讀影片、也不建資料夾）"""
+        import time as _t
+        d, f, _ = self.scene('a.avi', 40, trains=[dict(t0=5, d=1)], blobs=[(25, 28, 335, 190, 22)])
+        evs, prof = self.run_files([f], [0.0])
+        res = {}
+        for mode in ('all', 'shots', 'none'):
+            es = [dict(e) for e in evs]
+            prof.make_clips, prof.make_shots = mode == 'all', mode != 'none'
+            out = os.path.join(d, 'out_' + mode)
+            t0 = _t.time()
+            core.save_frames_and_clips(es, prof, out, files=[f], bases=[0.0])
+            res[mode] = (_t.time() - t0, es, out)
+        _, es, out = res['all']
+        v = next(e for e in es if e['valid'])
+        self.assertTrue(v['clip'] and len(v['shots']) == 3)
+        _, es, out = res['shots']
+        self.assertTrue(all(len(e['shots']) == 3 and not e['clip'] for e in es))
+        self.assertFalse(os.path.isdir(os.path.join(out, '短片')))
+        t, es, out = res['none']
+        self.assertTrue(all(e['shots'] == [] and e['clip'] == '' and e['media_tag'] for e in es))
+        self.assertFalse(os.path.isdir(os.path.join(out, '截圖')) or os.path.isdir(os.path.join(out, '短片')))
+        self.assertLess(t, 0.05, '都不要：不讀影片')
+        self.assertLess(res['shots'][0], res['all'][0], '只要截圖比截圖＋短片快')
+
     def test60b_media_tag_no_overwrite(self):
         """#60 已排除改成列車後補做短片：用原本的檔名前綴（X001），不可以蓋到其他列車的截圖與短片"""
         d, f, _ = self.scene('a.avi', 40, trains=[dict(t0=5, d=1)], blobs=[(25, 28, 335, 190, 22)])

@@ -61,6 +61,7 @@ class Profile:
     clip_before: float = 3.0              # 短片：事件前幾秒
     clip_after: float = 3.0               # 短片：事件後幾秒
     make_clips: bool = True
+    make_shots: bool = True               # v1.0.18（#106）：截圖；和 make_clips 都 False＝不產生截圖與短片（最快）
     osd_rect: list = dataclasses.field(default_factory=lambda: [14, 8, 204, 24])   # 時間字幕外框 [x0,y0,x1,y1]
     osd_format: str = 'YYYY-MM-DD HH:MM:SS'
     osd_templates: list = None            # 「教程式認字」學到的字樣；None＝內建
@@ -1412,7 +1413,17 @@ def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None,
     「車頭前 clip_before～車頭後 CLIP_PART 秒」＋「車尾前 CLIP_PART 秒～車尾後 clip_after」兩段接在一起（#59）。
     跨幾支影片都照畫面時間切成每支影片的一段，依序接起來（v1.0.8 以前只接開始與結束兩支，中間的會漏掉，#54）。
     files／bases：影片處理順序與每支的時間起點（判讀時的時間對照）。"""
-    shot_dir = os.path.join(out_dir, '截圖'); os.makedirs(shot_dir, exist_ok=True)
+    make_shots = getattr(profile, 'make_shots', True)
+    if not make_shots and not profile.make_clips:      # 都不要（#106）：不再把影片讀一次
+        for ev in events:
+            ev['media_tag'] = ev.get('media_tag') or ('%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no'])
+            ev['shots'], ev['clip'] = [], ''
+        if progress:
+            progress(1.0, '不產生截圖與短片')
+        return
+    shot_dir = os.path.join(out_dir, '截圖')
+    if make_shots:
+        os.makedirs(shot_dir, exist_ok=True)
     clip_dir = os.path.join(out_dir, '短片')
     if profile.make_clips:
         os.makedirs(clip_dir, exist_ok=True)
@@ -1433,15 +1444,19 @@ def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None,
         ev['media_tag'] = ev['tag']
         ev['shots'], ev['clip'] = [], ''
         # 車頭／車尾未確認時，截圖名稱不寫「車頭／車尾」，避免人工覆核時誤以為是確定的時間（#70）
-        shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭' if ev.get('start_known', True) else '1第一畫面_車頭未確認'))
-        if ev.get('valid') or not ev.get('peak_file'):
+        if make_shots:            # 只要短片時不存截圖（#106）
+            shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭' if ev.get('start_known', True) else '1第一畫面_車頭未確認'))
+        if not make_shots:
+            pass
+        elif ev.get('valid') or not ev.get('peak_file'):
             m = _at(tl, order, (ev['start'] + ev['end']) / 2)
             if m is None:                 # 中間落在缺口：用車頭那支影片
                 m = (ev['start_file'], ev['start_pos'] + 1.0)
             shots[m[0]].append((m[1], ev, '2中間'))
         else:
             shots[ev['peak_file']].append((ev['peak_pos'], ev, '2變化最大'))
-        shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾' if ev.get('end_known', True) else '3最後畫面_車尾未確認'))
+        if make_shots:
+            shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾' if ev.get('end_known', True) else '3最後畫面_車尾未確認'))
         if profile.make_clips and ev.get('valid'):
             a, b = ev['start'] - profile.clip_before, ev['end'] + profile.clip_after
             spans = [(a, b)] if ev['end'] - ev['start'] <= LONG_CLIP else \

@@ -20,7 +20,7 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.17'
+VERSION = '1.0.18'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
@@ -622,6 +622,13 @@ class App:
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(2, 0))
         self._lk(ttk.Button(r, text='選擇存放位置…', command=self.choose_out_location)).pack(side='left')
         self._lk(ttk.Button(r, text='改回影片旁邊', command=self.reset_out_location)).pack(side='left', padx=(4, 0))
+        # 判讀完要不要產生截圖與短片（#106）：急著要檔案時選「只要截圖」或「都不要」比較快；記住上次的選擇
+        r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
+        ttk.Label(r, text='產生：').pack(side='left')
+        self.var_media = tk.StringVar(value=self._load_media_pref())
+        for val, lab in (('all', '截圖＋短片'), ('shots', '只要截圖'), ('none', '都不要（最快）')):
+            self._lk(ttk.Radiobutton(r, text=lab, value=val, variable=self.var_media,
+                                     command=self._save_media_pref)).pack(side='left', padx=(0, 6))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
         self.btn_cancel = ttk.Button(r, text='取消', width=6, command=self.cancel_run, state='disabled')
         self.btn_cancel.pack(side='right', fill='y', padx=(4, 0))
@@ -707,14 +714,22 @@ class App:
         msg = ttk.Label(r2, textvariable=self.var_tab2msg, foreground='#1060c0', justify='left', wraplength=400)
         msg.pack(side='left', fill='x', expand=True, padx=(16, 0), anchor='n')
         msg.bind('<Configure>', lambda e: msg.configure(wraplength=max(150, e.width - 4)))
+        # 第三行：勾選多筆一次修改（#105）
+        r3 = ttk.Frame(t); r3.pack(fill='x', padx=4, pady=(0, 4))
+        ttk.Button(r3, text='勾選全部已排除', command=self.pick_all_excluded).pack(side='left')
+        ttk.Button(r3, text='全不選', command=self.pick_none).pack(side='left', padx=(4, 0))
+        ttk.Button(r3, text='勾選的改為列車', command=lambda: self.batch_valid(True)).pack(side='left', padx=(12, 0))
+        ttk.Button(r3, text='勾選的改為不是列車', command=lambda: self.batch_valid(False)).pack(side='left', padx=(4, 0))
+        self.var_pick = tk.StringVar(value='')
+        ttk.Label(r3, textvariable=self.var_pick).pack(side='left', padx=(12, 0))
         body = ttk.Frame(t); body.pack(fill='both', expand=True, padx=4)
         rf = ttk.Frame(body); rf.pack(side='right', fill='y', padx=(8, 0))
         ttk.Frame(rf, width=500, height=1).pack(side='bottom')     # 撐住寬度 500
         lf = ttk.Frame(body, width=420, height=200); lf.pack(side='left', fill='both', expand=True)
         lf.pack_propagate(False)        # 清單最少 420×200，比這個窄就用清單下方的水平捲軸
-        cols = ('no', 'date', 'start', 'end', 'dur', 'dir', 'type', 'cross', 'check', 'reason')
-        heads = ('編號', '日期', '車頭到達', '車尾離開', '秒數', '方向', '車種', '交會', '需確認', '備註')
-        widths = (46, 56, 86, 86, 46, 70, 100, 44, 56, 240)
+        cols = ('pick', 'no', 'date', 'start', 'end', 'dur', 'dir', 'type', 'cross', 'check', 'reason')
+        heads = ('勾選', '編號', '日期', '車頭到達', '車尾離開', '秒數', '方向', '車種', '交會', '需確認', '備註')
+        widths = (40, 46, 56, 86, 86, 46, 70, 100, 44, 56, 240)
         self.tv = ttk.Treeview(lf, columns=cols, show='headings', selectmode='browse')
         for c, h, w in zip(cols, heads, widths):
             self.tv.heading(c, text=h)
@@ -727,7 +742,10 @@ class App:
         self.tv.pack(side='left', fill='both', expand=True); sb.pack(side='left', fill='y')
         self.tv.tag_configure('need', background='#fff2cc')
         self.tv.tag_configure('excl', foreground='#666666')
+        self.tv.tag_configure('picked', background='#dcefd2')     # 勾選的列加淡綠底（灰字的已排除也看得出來，#105）
         self.tv.bind('<<TreeviewSelect>>', lambda e: self.on_event_select())
+        self.tv.bind('<Button-1>', self._on_tv_click, add='+')
+        self.tv.heading('pick', text='勾選', command=self.pick_toggle_shown)   # 點欄名＝目前清單全部勾選／取消
 
         self.shot_canvas = tk.Canvas(rf, width=480, height=270, bg='#202020', highlightthickness=0)
         self.shot_canvas.pack(pady=(0, 4))
@@ -766,6 +784,7 @@ class App:
         self.btn_valid.pack(side='left', padx=6)
         for line in ('淡黃色＝需要人工確認（方向不確定、影片一開始就有車等）。',
                      '看過後勾「已人工確認」，再按「套用修改」（時間例：08:15:30.5）。',
+                     '很多筆要一起改：在清單最左邊「勾選」欄點一下勾選，再按上方「勾選的改為列車」。',
                      '修改完記得按上方「儲存修改並重新輸出 Excel」。'):
             ttk.Label(rf, style='Hint.TLabel', text=line).pack(fill='x', pady=(1, 0))
 
@@ -968,6 +987,23 @@ class App:
         except OSError:
             pass
 
+    def _load_media_pref(self):
+        try:
+            with open(os.path.join(self.prof_dir, '_產生截圖短片.txt'), encoding='utf-8') as fh:
+                v = fh.read().strip()
+            if v in ('all', 'shots', 'none'):
+                return v
+        except OSError:
+            pass
+        return 'all' if self.profile.make_clips else 'shots'     # 第一次：照舊版「進階設定」的短片勾選
+
+    def _save_media_pref(self):
+        try:
+            with open(os.path.join(self.prof_dir, '_產生截圖短片.txt'), 'w', encoding='utf-8') as fh:
+                fh.write(self.var_media.get())
+        except OSError:
+            pass
+
     def _load_last_profile(self):
         try:
             with open(os.path.join(self.prof_dir, '_上次使用.txt'), encoding='utf-8') as fh:
@@ -1008,8 +1044,8 @@ class App:
         ttk.Entry(w, textvariable=vf, width=22).grid(row=n, column=1, columnspan=2, sticky='w', padx=4)
         ttk.Label(w, text='Y 年、M 月、D 日、H 時、M 分、S 秒；其他字元照畫面上的寫（例：YYYY/MM/DD HH:MM:SS）',
                   style='Hint.TLabel').grid(row=n + 1, column=0, columnspan=3, sticky='w', padx=10)
-        vc = tk.BooleanVar(value=p.make_clips)
-        ttk.Checkbutton(w, text='每筆產生短片（會多花一點時間）', variable=vc).grid(row=n + 2, column=0, columnspan=3, sticky='w', padx=10, pady=4)
+        ttk.Label(w, style='Hint.TLabel', text='截圖與短片：在第 1 頁「判讀」區的「產生：截圖＋短片／只要截圖／都不要」選擇（v1.0.18 起）。'
+                  ).grid(row=n + 2, column=0, columnspan=3, sticky='w', padx=10, pady=4)
         vt = tk.BooleanVar(value=False)
         ttk.Checkbutton(w, text='時間字樣恢復內建（取消「教程式認字」學到的）', variable=vt).grid(row=n + 3, column=0, columnspan=3, sticky='w', padx=10)
 
@@ -1038,7 +1074,6 @@ class App:
             for k, v in vals.items():
                 setattr(p, k, v)
             p.osd_format = vf.get()
-            p.make_clips = bool(vc.get())
             if vt.get():
                 p.osd_templates = None
             w.destroy()
@@ -1049,7 +1084,6 @@ class App:
             for k, v in vars_.items():
                 v.set(str(getattr(d, k)))
             vf.set(d.osd_format)
-            vc.set(d.make_clips)
         box = ttk.LabelFrame(w, text='設定存放位置（所有監測站共用）')
         box.grid(row=n + 4, column=0, columnspan=3, sticky='we', padx=10, pady=(10, 0))
         ttk.Label(box, text=self.data_root, foreground='#1060c0').pack(anchor='w', padx=8, pady=(4, 0))
@@ -1479,6 +1513,8 @@ class App:
                                        + '\n\n確定要照目前的清單判讀嗎？', ok='仍要判讀', warn=True):
             return
         prof = self._collect_profile()
+        media = self.var_media.get()                       # 截圖＋短片／只要截圖／都不要（#106）
+        prof.make_clips, prof.make_shots = media == 'all', media != 'none'
         files = [f['path'] for f in self.files]
         manual = [f.get('manual') for f in self.files]
         if self.out_location and not os.path.isdir(self.out_location):
@@ -2017,13 +2053,108 @@ class App:
                 continue
             need = e['valid'] and e.get('need_check') and not e.get('checked')
             d = dt.datetime.fromtimestamp(e['start'])
-            vals = (e['no'] if e['valid'] else 'X%d' % e['no'], d.strftime('%m-%d'), core.fmt_time(e['start']),
+            vals = ('☑' if e.get('_pick') else '☐', e['no'] if e['valid'] else 'X%d' % e['no'], d.strftime('%m-%d'), core.fmt_time(e['start']),
                     core.fmt_time(e['end']), '%.1f' % (e['end'] - e['start']), e.get('direction', ''),
                     e.get('train_type', ''), '是' if e.get('crossing') else '',
                     '是' if need else ('已確認' if e.get('checked') else ''),
                     (e.get('reason') or '') + (('；' + e['note']) if e.get('note') else ''))
-            self.tv.insert('', 'end', iid=str(i), values=vals, tags=('need',) if need else (('excl',) if not e['valid'] else ()))
+            tags = ('need',) if need else (('excl',) if not e['valid'] else ())
+            self.tv.insert('', 'end', iid=str(i), values=vals, tags=tags + (('picked',) if e.get('_pick') else ()))
         self.var_sum.set('列車 %d 筆（需確認 %d）、已排除 %d 筆' % (nv, nn, nx))
+        self._upd_pick()
+
+    # ---- 勾選多筆一次修改（#105）：勾選只在畫面上，不存進結果（匯出只寫固定欄位）
+    def _upd_pick(self):
+        n = sum(1 for e in self.events or [] if e.get('_pick'))
+        nh = sum(1 for e in self.events or [] if e.get('_pick') and not e['valid'] and not self.show_excluded.get())
+        self.var_pick.set(('已勾選 %d 筆' % n + ('（其中 %d 筆是已排除、目前沒顯示）' % nh if nh else '')) if n else
+                          '在清單最左邊「勾選」欄點一下可以勾選多筆')
+
+    def _mark_pick(self, k, on):
+        self.tv.set(k, 'pick', '☑' if on else '☐')
+        tags = tuple(t for t in self.tv.item(k, 'tags') if t != 'picked')
+        self.tv.item(k, tags=tags + (('picked',) if on else ()))
+
+    def _on_tv_click(self, ev):
+        if self.tv.identify_region(ev.x, ev.y) != 'cell' or self.tv.identify_column(ev.x) != '#1':
+            return None
+        row = self.tv.identify_row(ev.y)
+        if not row:
+            return None
+        e = self.events[int(row)]
+        e['_pick'] = not e.get('_pick')
+        self._mark_pick(row, e['_pick'])
+        self._upd_pick()
+        return 'break'          # 打勾不改變目前看的那一筆
+
+    def pick_toggle_shown(self):
+        kids = self.tv.get_children()
+        if not kids:
+            return
+        on = not all(self.events[int(k)].get('_pick') for k in kids)
+        for k in kids:
+            self.events[int(k)]['_pick'] = on
+            self._mark_pick(k, on)
+        self._upd_pick()
+
+    def pick_all_excluded(self):
+        if not self.events:
+            return
+        if not self.show_excluded.get():
+            messagebox.showinfo(APP, '請先勾「顯示已排除（非列車／閃爍）」，看得到已排除的事件後再勾選。')
+            return
+        for k in self.tv.get_children():
+            e = self.events[int(k)]
+            if not e['valid']:
+                e['_pick'] = True
+                self._mark_pick(k, True)
+        self._upd_pick()
+
+    def pick_none(self):
+        for e in self.events or []:
+            e.pop('_pick', None)
+        for k in self.tv.get_children():
+            self._mark_pick(k, False)
+        self._upd_pick()
+
+    def batch_valid(self, want):
+        picked = [e for e in self.events or [] if e.get('_pick')]
+        if not picked:
+            messagebox.showinfo(APP, '還沒有勾選。請在清單最左邊「勾選」欄點一下勾選要改的事件。')
+            return
+        if self._media_busy():
+            return
+        todo = [e for e in picked if bool(e['valid']) != want]
+        if not todo:
+            messagebox.showinfo(APP, '勾選的 %d 筆本來就都是%s。' % (len(picked), '列車' if want else '「不是列車」'))
+            return
+        if want:
+            q = '把勾選的 %d 筆改為列車？\n\n不會補做短片（Excel 裡這幾筆的短片欄是空的），截圖照舊；要看影片可以按「在影片中看這段」。' % len(todo)
+        else:
+            q = '把勾選的 %d 筆改為「不是列車」？' % len(todo)
+        if len(picked) > len(todo):
+            q += '\n\n（另有 %d 筆本來就是%s，不變。）' % (len(picked) - len(todo), '列車' if want else '「不是列車」')
+        if not messagebox.askyesno(APP, q):
+            return
+        tag = '人工改為列車' if want else '人工改為非列車'
+        for e in todo:
+            e['valid'] = want
+            note = e.get('note') or ''
+            if tag not in note:
+                e['note'] = (note + '；' + tag).strip('；')
+        for e in self.events:
+            e.pop('_pick', None)
+        _, cur = self._sel_event()
+        self.set_dirty(True)
+        core.number_events(self.events)
+        self.fill_events()
+        if cur is not None:
+            k = next((str(j) for j, x in enumerate(self.events) if x is cur), None)
+            if k and self.tv.exists(k):
+                self.tv.selection_set(k); self.tv.see(k)
+        self.var_tab2msg.set('已把 %d 筆改為%s。%s修改完記得按「儲存修改並重新輸出 Excel」。' % (
+            len(todo), '列車' if want else '「不是列車」',
+            '' if want or self.show_excluded.get() else '要再看到它們，請勾「顯示已排除」。'))
 
     def _sel_event(self):
         sel = self.tv.selection()
@@ -2160,9 +2291,12 @@ class App:
     def regen_media(self, e, why='time'):
         """依這一筆目前的時間重做截圖與短片（時間改過、或改成「是列車」時），在背景做。
         背景只處理副本，做完由畫面執行緒一次套用；做的時候不能再套用修改或儲存（#55）"""
+        prof = self.run_profile or self.profile
+        if not getattr(prof, 'make_shots', True) and not prof.make_clips:    # 這次判讀選了「都不要」（#106）
+            self.var_tab2msg.set('這份結果判讀時選了「不產生截圖與短片」，這一筆也不產生；要看畫面請按「在影片中看這段」。')
+            return
         e['media_busy'] = True
         e['_regen_why'] = why
-        prof = self.run_profile or self.profile
         files = list(self.run_files)
         bases = [t.get('offset') for t in self.run_timing] if self.run_timing else None
         out = self.result_dir
