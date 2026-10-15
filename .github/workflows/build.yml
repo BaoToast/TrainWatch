@@ -57,6 +57,8 @@ jobs:
 
           # 3) 套件裝進 runtime/Lib/site-packages
           python -m pip install -r requirements.txt --only-binary=:all: --target "$rt/Lib/site-packages"
+          # pip 會順便放一個沒有數位簽章的 f2py.exe（numpy 的開發工具，程式用不到）；拿掉，避免被防毒誤判（#118）
+          Remove-Item -Recurse -Force -ErrorAction SilentlyContinue "$rt/Lib/site-packages/bin"
 
           # 4) 告訴免安裝版的 Python 去哪裡找：標準函式庫、tkinter、套件、程式
           $pth = Get-ChildItem "$rt/python*._pth" | Select-Object -First 1
