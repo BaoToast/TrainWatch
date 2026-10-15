@@ -21,10 +21,11 @@ from PIL import Image, ImageTk
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.20'
+VERSION = '1.0.21'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
+SHOT_W, SHOT_H = 448, 252  # 第 2 頁截圖大小（#121：1366×768 的螢幕不用整頁捲動）
 CORNER_PICK = 10          # 按在軌道範圍的角附近幾個畫面像素內＝拖曳那個角（#114）
 CANVAS_W, CANVAS_H = 900, 506      # 第 1 頁影片畫面的「建議」大小；實際大小跟著視窗縮放
 # 每一頁內容的最小尺寸：視窗比這個小時出現捲軸，內容不會被切掉（v1.0.7）
@@ -51,7 +52,7 @@ def app_dir():
 
 
 RESULT_FOLDER = '判讀結果'
-STATUS_EMPTY = '請先加入影片，再在右邊畫參考線與軌道範圍。'
+STATUS_EMPTY = '請先加入影片（按「加入影片…」，或把影片、整個資料夾從檔案總管拖進這個視窗），再在右邊畫參考線與軌道範圍。'
 STATUS_READY = '影片已加入。畫好框線後，按「開始判讀」。'
 
 
@@ -380,6 +381,92 @@ def mark_time_jumps(evs, files, timing):
             e.setdefault('check_items', []).append('影片的畫面時間有跳動')
 
 
+EXCL_CATS = (('剛切換日夜模式', '攝影機剛切換日夜模式（亮度調整中）'), ('切換成', '攝影機切換日夜模式'),
+             ('攝影機位置在', '攝影機位置改變'), ('時間太短', '時間太短（閃爍）'),
+             ('變化範圍太小', '軌道範圍內變化範圍太小'), ('只有參考線一側', '只有參考線一側有變化'))
+
+
+def excl_category(e):
+    """已排除事件的原因分類（#122 篩選用）：人工改的另外一類，其他看系統備註的第一句"""
+    if '人工改為非列車' in (e.get('note') or ''):
+        return '人工改為不是列車'
+    first = (e.get('reason') or '').split('；')[0]
+    for kw, lab in EXCL_CATS:
+        if kw in first:
+            return lab
+    return '其他（請看備註）'
+
+
+VIDEO_EXTS = tuple(x.replace('*', '') for x in VIDEO_TYPES[0][1].split())
+
+
+def expand_dropped(paths):
+    """拖進來的檔案與資料夾 → 影片檔清單（資料夾會連子資料夾一起找，依路徑排序）、略過幾個不是影片的檔案（#120）"""
+    vids, skipped = [], 0
+    for p in paths:
+        if os.path.isdir(p):
+            found = []
+            for r, _ds, fs in os.walk(p):
+                found += [os.path.join(r, f) for f in fs if f.lower().endswith(VIDEO_EXTS)]
+            vids += sorted(found)
+        elif os.path.isfile(p):
+            if p.lower().endswith(VIDEO_EXTS):
+                vids.append(p)
+            else:
+                skipped += 1
+    return vids, skipped
+
+
+def enable_file_drop(widget, callback):
+    """讓 Windows 檔案總管可以把檔案拖進這個視窗（#120）。只用 Windows 內建的功能（ctypes），不用另外安裝套件。
+    callback(list of 路徑) 會在畫面執行緒呼叫。不是 Windows 或失敗時回傳 False（照樣可以用「加入影片…」）"""
+    if not sys.platform.startswith('win'):
+        return False
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32, shell32 = ctypes.windll.user32, ctypes.windll.shell32
+        LRESULT = ctypes.c_ssize_t
+        WNDPROC = ctypes.WINFUNCTYPE(LRESULT, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM)
+        user32.GetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.GetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.SetWindowLongPtrW.restype = ctypes.c_void_p
+        user32.SetWindowLongPtrW.argtypes = [wintypes.HWND, ctypes.c_int, ctypes.c_void_p]
+        user32.CallWindowProcW.restype = LRESULT
+        user32.CallWindowProcW.argtypes = [ctypes.c_void_p, wintypes.HWND, wintypes.UINT, wintypes.WPARAM, wintypes.LPARAM]
+        shell32.DragQueryFileW.restype = wintypes.UINT
+        shell32.DragQueryFileW.argtypes = [ctypes.c_void_p, wintypes.UINT, ctypes.c_wchar_p, wintypes.UINT]
+        shell32.DragFinish.argtypes = [ctypes.c_void_p]
+        shell32.DragAcceptFiles.argtypes = [wintypes.HWND, wintypes.BOOL]
+        WM_DROPFILES, GWLP_WNDPROC = 0x0233, -4
+        hwnd = widget.winfo_id()
+        old = user32.GetWindowLongPtrW(hwnd, GWLP_WNDPROC)
+
+        def proc(h, msg, wp, lp):
+            if msg == WM_DROPFILES:
+                try:
+                    n = shell32.DragQueryFileW(wp, 0xFFFFFFFF, None, 0)
+                    out = []
+                    for i in range(n):
+                        size = shell32.DragQueryFileW(wp, i, None, 0) + 1
+                        buf = ctypes.create_unicode_buffer(size)
+                        shell32.DragQueryFileW(wp, i, buf, size)
+                        out.append(buf.value)
+                finally:
+                    shell32.DragFinish(wp)
+                widget.after(0, lambda o=out: callback(o))
+                return 0
+            return user32.CallWindowProcW(old, h, msg, wp, lp)
+
+        cb = WNDPROC(proc)
+        widget._drop_proc = cb                 # 留住參照，不然會被回收、程式當掉
+        user32.SetWindowLongPtrW(hwnd, GWLP_WNDPROC, ctypes.cast(cb, ctypes.c_void_p))
+        shell32.DragAcceptFiles(hwnd, True)
+        return True
+    except Exception:
+        return False
+
+
 def quality_summary(evs, cancelled=False, timing=()):
     """判讀完成的品質摘要文字（#61）"""
     valid = [e for e in evs if e.get('valid')]
@@ -524,6 +611,7 @@ class App:
         if os.environ.get('CI') != 'true':      # GitHub Actions 的自動測試不要跳出詢問視窗
             root.after(500, self._first_run_check)
         root.after(150, self._poll)
+        root.after(300, lambda: enable_file_drop(root, self.on_drop))   # 從檔案總管拖影片進來（#120）
 
     def _on_wheel(self, e):
         """滑鼠滾輪捲動整頁（只有視窗太小、出現捲軸時）。在清單上滾動仍是捲清單"""
@@ -634,7 +722,7 @@ class App:
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
         ttk.Label(r, text='產生：').pack(side='left')
         self.var_media = tk.StringVar(value=self._load_media_pref())
-        for val, lab in (('all', '截圖＋短片'), ('shots', '只要截圖'), ('none', '都不要（最快）')):
+        for val, lab in (('all', '截圖＋短片'), ('shots', '只要截圖'), ('excl', '只有已排除的做截圖'), ('none', '都不要（最快）')):
             self._lk(ttk.Radiobutton(r, text=lab, value=val, variable=self.var_media,
                                      command=self._save_media_pref)).pack(side='left', padx=(0, 6))
         r = ttk.Frame(box); r.pack(fill='x', padx=6, pady=(6, 0))
@@ -724,8 +812,23 @@ class App:
         r2 = ttk.Frame(t); r2.pack(fill='x', padx=4, pady=(0, 4))
         ttk.Checkbutton(r2, text='顯示已排除（非列車／閃爍）', variable=self.show_excluded,
                         command=self.fill_events).pack(side='left', anchor='n')
+        # 篩選（#122、#123）：同一種原因的事件一次看完，不用在正常的列車裡一筆一筆找
+        ttk.Label(r2, text='篩選：').pack(side='left', padx=(12, 0), anchor='n')
+        self.var_filter = tk.StringVar(value='全部')
+        self._filter_key, self._filter_map = 'all', {'全部': 'all'}
+        self.cb_filter = ttk.Combobox(r2, textvariable=self.var_filter, values=['全部'], width=26, state='readonly', style='Filter.TCombobox')
+        self.cb_filter.pack(side='left', anchor='n')
+        self.cb_filter.bind('<<ComboboxSelected>>', lambda e: self._on_filter())
+        self.cb_filter.configure(postcommand=self._widen_filter_list)
+        self.var_long = tk.BooleanVar(value=False)
+        self.var_long_sec = tk.StringVar(value='10')
+        ttk.Checkbutton(r2, text='只看超過', variable=self.var_long, command=self.fill_events).pack(side='left', padx=(10, 0), anchor='n')
+        el = ttk.Entry(r2, textvariable=self.var_long_sec, width=4)
+        el.pack(side='left', anchor='n')
+        el.bind('<Return>', lambda e: self.fill_events()); el.bind('<FocusOut>', lambda e: self.var_long.get() and self.fill_events())
+        ttk.Label(r2, text='秒的').pack(side='left', anchor='n')
         self.var_sum = tk.StringVar(value='')
-        ttk.Label(r2, textvariable=self.var_sum).pack(side='left', padx=(12, 0), anchor='n')
+        ttk.Label(r2, textvariable=self.var_sum).pack(side='left', padx=(8, 0), anchor='n')
         self.var_tab2msg = tk.StringVar(value='')
         msg = ttk.Label(r2, textvariable=self.var_tab2msg, foreground='#1060c0', justify='left', wraplength=400)
         msg.pack(side='left', fill='x', expand=True, padx=(16, 0), anchor='n')
@@ -763,7 +866,7 @@ class App:
         self.tv.bind('<Button-1>', self._on_tv_click, add='+')
         self.tv.heading('pick', text='勾選', command=self.pick_toggle_shown)   # 點欄名＝目前清單全部勾選／取消
 
-        self.shot_canvas = tk.Canvas(rf, width=480, height=270, bg='#202020', highlightthickness=0)
+        self.shot_canvas = tk.Canvas(rf, width=SHOT_W, height=SHOT_H, bg='#202020', highlightthickness=0)
         self.shot_canvas.pack(pady=(0, 4))
         r = ttk.Frame(rf); r.pack(fill='x')
         self.shot_btns = []
@@ -796,17 +899,19 @@ class App:
         ttk.Entry(g, textvariable=self.var_note, width=40).grid(row=3, column=1, columnspan=3, sticky='we', padx=4)
         # 系統備註完整顯示在這裡（清單裡太長看不完，#120）
         ttk.Label(g, text='系統備註').grid(row=4, column=0, sticky='nw', pady=2)
-        self.var_reason = tk.StringVar(value='')
-        ttk.Label(g, textvariable=self.var_reason, style='Hint.TLabel', wraplength=380, justify='left'
-                  ).grid(row=4, column=1, columnspan=3, sticky='w', padx=4, pady=2)
+        # 固定兩行高、可以捲動（備註很長時版面不會一直變高，#121）
+        self.txt_reason = tk.Text(g, height=2, width=46, wrap='char', relief='flat', borderwidth=0,
+                                  background=ttk.Style().lookup('TFrame', 'background') or '#f0f0f0', foreground='#555555',
+                                  font=tkfont.nametofont('TkDefaultFont'), cursor='arrow', takefocus=0)
+        self.txt_reason.grid(row=4, column=1, columnspan=3, sticky='we', padx=4, pady=2)
+        self.txt_reason.configure(state='disabled')
         r = ttk.Frame(ed); r.pack(fill='x', padx=8, pady=(0, 8))
         ttk.Button(r, text='套用修改', command=self.apply_edit).pack(side='left')
         self.btn_valid = ttk.Button(r, text='改為「不是列車」', command=self.toggle_valid)
         self.btn_valid.pack(side='left', padx=6)
-        for line in ('淡黃色＝需要人工確認（方向不確定、影片一開始就有車等）。',
-                     '看過後勾「已人工確認」，再按「套用修改」（時間例：08:15:30.5）。',
-                     '很多筆要一起改：在清單最左邊「勾選」欄點一下勾選，再按上方「勾選的改為列車」。',
-                     '修改完記得按上方「儲存修改並重新輸出 Excel」。'):
+        ttk.Button(r, text='拆成兩筆…', command=self.split_event).pack(side='left')   # 兩列車接連通過被當成一筆（#125）
+        # 說明縮成一行（#121：1366×768 的電腦螢幕不用整頁捲動就看得到清單下方的捲軸）
+        for line in ('淡黃色＝需人工確認。時間例：08:15:30.5。改完記得按上方「儲存修改並重新輸出 Excel」。',):
             ttk.Label(rf, style='Hint.TLabel', text=line).pack(fill='x', pady=(1, 0))
 
     # ------------------------------------------------------------ 設定的位置與匯入舊版
@@ -1014,7 +1119,7 @@ class App:
         try:
             with open(os.path.join(self.prof_dir, '_產生截圖短片.txt'), encoding='utf-8') as fh:
                 v = fh.read().strip()
-            if v in ('all', 'shots', 'none'):
+            if v in ('all', 'shots', 'excl', 'none'):
                 return v
         except OSError:
             pass
@@ -1136,6 +1241,24 @@ class App:
         paths = filedialog.askopenfilenames(title='選擇影片（可一次選多個）', filetypes=VIDEO_TYPES)
         if not paths:
             return
+        self._add_paths(paths)
+
+    def on_drop(self, paths):
+        """從檔案總管把影片（或整個資料夾）拖進視窗（#120）"""
+        if self._run_lock_on:
+            messagebox.showinfo(APP, '判讀中不能加入影片，請等這次判讀完成或取消後再拖進來。')
+            return
+        vids, skipped = expand_dropped(paths)
+        if not vids:
+            messagebox.showinfo(APP, '拖進來的%s沒有影片檔（%s）。' % ('資料夾裡' if any(os.path.isdir(p) for p in paths) else '檔案',
+                                                         VIDEO_TYPES[0][1].replace('*', '')))
+            return
+        self.nb.select(0)
+        self._add_paths(vids)
+        if skipped:
+            self.var_status.set('已加入拖進來的影片 %d 支；另有 %d 個不是影片的檔案沒有加入。' % (len(vids), skipped))
+
+    def _add_paths(self, paths):
         have = {os.path.normcase(f['path']) for f in self.files}
         cand = []
         for p in paths:
@@ -1481,7 +1604,7 @@ class App:
             self.rescan_all()
             return
         msg = self.check_geometry()
-        self.var_status.set(msg or '參考線與軌道範圍已更新（記得按「儲存」保存這個監測站）。')
+        self.var_status.set(msg or ('參考線與軌道範圍已更新（記得按「儲存」保存這個監測站）。' + self.geometry_note()))
 
     def check_geometry(self):
         p = self.profile
@@ -1509,8 +1632,21 @@ class App:
             x0, y0, x1, y1 = p.track_bounds()
             rp = p.ref_pos()
             lo, hi = (x0, x1) if p.horizontal() else (y0, y1)
-        if not (lo + 15 < rp < hi - 15):
-            return '參考線要在軌道範圍中間（兩側都要留一段），方向才判斷得出來。'
+        if not (lo + 3 < rp < hi - 3):            # 參考線位置由使用者決定，不必在中間；只是不能貼在範圍的邊上（#126）
+            return '參考線要穿過軌道範圍（不能貼在橘框的邊上），請重畫參考線或把橘框拉長一點。'
+        return ''
+
+    def geometry_note(self):
+        """不影響判讀、但要讓使用者知道的提醒（#126）：參考線很靠近軌道範圍的一端"""
+        p = self.profile
+        h, w = self.cur_frame.shape[:2] if self.cur_frame is not None else (100000, 100000)
+        try:
+            det = core.Detector(p, core.work_crop(p, w, h))
+        except ValueError:
+            return ''
+        if det.short_side:
+            return ('參考線靠近軌道範圍的一端：可以照常判讀（時間不受影響），'
+                    '但短的那一側太短，方向可能判斷不出來（會標「方向不確定」）。')
         return ''
 
     def teach_osd(self):
@@ -1580,8 +1716,9 @@ class App:
                                        + '\n\n確定要照目前的清單判讀嗎？', ok='仍要判讀', warn=True):
             return
         prof = self._collect_profile()
-        media = self.var_media.get()                       # 截圖＋短片／只要截圖／都不要（#106）
+        media = self.var_media.get()                       # 截圖＋短片／只要截圖／只有已排除的做截圖／都不要（#106、#124）
         prof.make_clips, prof.make_shots = media == 'all', media != 'none'
+        prof.shots_excluded_only = media == 'excl'
         files = [f['path'] for f in self.files]
         manual = [f.get('manual') for f in self.files]
         if self.out_location and not os.path.isdir(self.out_location):
@@ -2112,9 +2249,78 @@ class App:
             pass
 
     # ------------------------------------------------------------ 結果
+    def _widen_filter_list(self):
+        """下拉清單比欄位寬，長的原因名稱才看得完整（ttk 的 postoffset：往右多加的寬度）"""
+        try:
+            f = tkfont.nametofont('TkDefaultFont')
+            w = max(f.measure(v) for v in self.cb_filter.cget('values')) + 40
+            ttk.Style().configure('Filter.TCombobox', postoffset=(0, 0, max(0, w - self.cb_filter.winfo_width()), 0))
+        except Exception:
+            pass
+
+    def _on_filter(self):
+        self._filter_key = self._filter_map.get(self.var_filter.get(), 'all')
+        self.fill_events()
+
+    def _long_sec(self):
+        try:
+            return max(0.0, float(self.var_long_sec.get()))
+        except ValueError:
+            self.var_long_sec.set('10')
+            return 10.0
+
+    def _excl_visible(self):
+        """已排除的事件目前看得到嗎（勾了「顯示已排除」，或篩選選了已排除的類別）"""
+        k = getattr(self, '_filter_key', 'all')
+        return self.show_excluded.get() if k == 'all' else (k == 'excl' or k.startswith('x:'))
+
+    def _passes(self, e):
+        """這一筆要不要出現在清單（#122 篩選、#123 秒數）"""
+        k = getattr(self, '_filter_key', 'all')
+        need = e['valid'] and e.get('need_check') and not e.get('checked')
+        if k == 'all':
+            ok = e['valid'] or self.show_excluded.get()
+        elif k == 'need':
+            ok = bool(need)
+        elif k == 'excl':
+            ok = not e['valid']
+        elif k.startswith('x:'):
+            ok = not e['valid'] and excl_category(e) == k[2:]
+        elif k.startswith('c:'):
+            ok = bool(need) and k[2:] in (e.get('check_items') or ['其他（請看備註）'])
+        else:
+            ok = True
+        if ok and self.var_long.get():
+            ok = (e['end'] - e['start']) > self._long_sec()
+        return ok
+
+    def _update_filter_values(self):
+        """篩選的選項（附筆數），依目前的事件重算；原本選的類別沒有了就回到「全部」"""
+        evs = self.events or []
+        valid = [e for e in evs if e['valid']]
+        need = [e for e in valid if e.get('need_check') and not e.get('checked')]
+        excl = [e for e in evs if not e['valid']]
+        opts = [('全部', 'all'), ('只看需人工確認（%d）' % len(need), 'need'), ('只看已排除（%d）' % len(excl), 'excl')]
+        cc = {}
+        for e in need:
+            for it in (e.get('check_items') or ['其他（請看備註）']):
+                cc[it] = cc.get(it, 0) + 1
+        opts += [('需確認｜%s（%d）' % (k, n), 'c:' + k) for k, n in sorted(cc.items(), key=lambda x: -x[1])]
+        xc = {}
+        for e in excl:
+            k = excl_category(e)
+            xc[k] = xc.get(k, 0) + 1
+        opts += [('已排除｜%s（%d）' % (k, n), 'x:' + k) for k, n in sorted(xc.items(), key=lambda x: -x[1])]
+        self._filter_map = {lab: key for lab, key in opts}
+        self.cb_filter.configure(values=[lab for lab, _ in opts])
+        cur = next((lab for lab, key in opts if key == self._filter_key), None)
+        if cur is None:
+            self._filter_key, cur = 'all', '全部'
+        self.var_filter.set(cur)
+
     def fill_events(self):
         self.tv.delete(*self.tv.get_children())
-        show_x = self.show_excluded.get()
+        self._update_filter_values()
         nv = nx = nn = 0
         for i, e in enumerate(self.events):
             if e['valid']:
@@ -2123,7 +2329,7 @@ class App:
                     nn += 1
             else:
                 nx += 1
-            if not e['valid'] and not show_x:
+            if not self._passes(e):
                 continue
             need = e['valid'] and e.get('need_check') and not e.get('checked')
             d = dt.datetime.fromtimestamp(e['start'])
@@ -2134,7 +2340,9 @@ class App:
                     (e.get('reason') or '') + (('；' + e['note']) if e.get('note') else ''))
             tags = ('need',) if need else (('excl',) if not e['valid'] else ())
             self.tv.insert('', 'end', iid=str(i), values=vals, tags=tags + (('picked',) if e.get('_pick') else ()))
-        self.var_sum.set('列車 %d 筆（需確認 %d）、已排除 %d 筆' % (nv, nn, nx))
+        shown = len(self.tv.get_children())
+        self.var_sum.set('列車 %d 筆（需確認 %d）、已排除 %d 筆%s' % (
+            nv, nn, nx, '' if self._filter_key == 'all' and not self.var_long.get() else '；顯示 %d 筆' % shown))
         self._fit_columns()
         self._upd_pick()
 
@@ -2155,8 +2363,8 @@ class App:
     # ---- 勾選多筆一次修改（#105）：勾選只在畫面上，不存進結果（匯出只寫固定欄位）
     def _upd_pick(self):
         n = sum(1 for e in self.events or [] if e.get('_pick'))
-        nh = sum(1 for e in self.events or [] if e.get('_pick') and not e['valid'] and not self.show_excluded.get())
-        self.var_pick.set(('已勾選 %d 筆' % n + ('（其中 %d 筆是已排除、目前沒顯示）' % nh if nh else '')) if n else
+        nh = sum(1 for e in self.events or [] if e.get('_pick') and not self._passes(e))
+        self.var_pick.set(('已勾選 %d 筆' % n + ('（其中 %d 筆目前沒顯示）' % nh if nh else '')) if n else
                           '在清單最左邊「勾選」欄點一下可以勾選多筆')
 
     def _mark_pick(self, k, on):
@@ -2189,8 +2397,8 @@ class App:
     def pick_all_excluded(self):
         if not self.events:
             return
-        if not self.show_excluded.get():
-            messagebox.showinfo(APP, '請先勾「顯示已排除（非列車／閃爍）」，看得到已排除的事件後再勾選。')
+        if not self._excl_visible():
+            messagebox.showinfo(APP, '請先勾「顯示已排除（非列車／閃爍）」，或在「篩選」選已排除的類別，看得到已排除的事件後再勾選。')
             return
         for k in self.tv.get_children():
             e = self.events[int(k)]
@@ -2243,7 +2451,7 @@ class App:
                 self.tv.selection_set(k); self.tv.see(k)
         self.var_tab2msg.set('已把 %d 筆改為%s。%s修改完記得按「儲存修改並重新輸出 Excel」。' % (
             len(todo), '列車' if want else '「不是列車」',
-            '' if want or self.show_excluded.get() else '要再看到它們，請勾「顯示已排除」。'))
+            '' if want or self._excl_visible() else '要再看到它們，請勾「顯示已排除」。'))
 
     def _sel_event(self):
         sel = self.tv.selection()
@@ -2257,7 +2465,10 @@ class App:
         self.var_dir.set(e.get('direction', '')); self.var_type.set(e.get('train_type', ''))
         self.var_cross.set(bool(e.get('crossing'))); self.var_checked.set(bool(e.get('checked')))
         self.var_note.set(e.get('note', ''))
-        self.var_reason.set((e.get('reason', '') or '（無）').replace(' ', '\u00a0'))   # 不在空格處換行，一行排滿
+        self.txt_reason.configure(state='normal')
+        self.txt_reason.delete('1.0', 'end')
+        self.txt_reason.insert('1.0', e.get('reason', '') or '（無）')
+        self.txt_reason.configure(state='disabled')
         self.btn_valid.configure(text='改為「不是列車」' if e['valid'] else '改為「是列車」')
         has_peak = any('2變化最大' in x for x in (e.get('shots') or []))
         self.shot_btns[1].configure(text='變化最大' if has_peak else '中間')
@@ -2279,9 +2490,9 @@ class App:
         path = os.path.join(self.result_dir, '截圖', name)
         try:
             im = Image.open(path)
-            im.thumbnail((480, 270))
+            im.thumbnail((SHOT_W, SHOT_H))
             self.shot_img = ImageTk.PhotoImage(im)
-            self.shot_canvas.create_image(240, 135, image=self.shot_img)
+            self.shot_canvas.create_image(SHOT_W // 2, SHOT_H // 2, image=self.shot_img)
             self.var_shotlab.set(name)
         except Exception:
             self.var_shotlab.set('找不到截圖：%s' % name)
@@ -2385,6 +2596,9 @@ class App:
         if not getattr(prof, 'make_shots', True) and not prof.make_clips:    # 這次判讀選了「都不要」（#106）
             self.var_tab2msg.set('這份結果判讀時選了「不產生截圖與短片」，這一筆也不產生；要看畫面請按「在影片中看這段」。')
             return
+        if getattr(prof, 'shots_excluded_only', False) and e.get('valid'):  # 只有程式判定排除的做截圖（#124）
+            self.var_tab2msg.set('這份結果判讀時選了「只有已排除的做截圖」，列車不產生截圖；要看畫面請按「在影片中看這段」。')
+            return
         e['media_busy'] = True
         e['_regen_why'] = why
         files = list(self.run_files)
@@ -2428,16 +2642,102 @@ class App:
         self._refresh_keep(e)
         if e['valid'] and not e.get('clip') and (self.run_profile or self.profile).make_clips and self.result_dir:
             self.regen_media(e, why='valid')        # 已排除的沒有短片（#60），改成列車時補做
-        if not e['valid'] and not self.show_excluded.get():
-            # 不自動打開「顯示已排除」（使用者要求）；那一筆從清單消失，改選它原本位置的下一筆
+        if not self._passes(e):
+            # 不自動打開「顯示已排除」（使用者要求）；那一筆從清單消失（篩選中也一樣），改選它原本位置的下一筆
             kids = self.tv.get_children()
             if kids:
                 nxt = next((k for k in kids if self.events[int(k)]['start'] >= e['start']), kids[-1])
                 self.tv.selection_set(nxt); self.tv.see(nxt)
             else:
                 self.shot_canvas.delete('all'); self.var_shotlab.set('')
-            self.var_tab2msg.set('已把 %s～%s 那一筆改為「不是列車」。要再看到它，請勾「顯示已排除」。'
-                                 % (core.fmt_time(e['start']), core.fmt_time(e['end'])))
+            self.var_tab2msg.set('已把 %s～%s 那一筆改為%s。%s' % (
+                core.fmt_time(e['start']), core.fmt_time(e['end']), '列車' if e['valid'] else '「不是列車」',
+                '要再看到它，請勾「顯示已排除」。' if not e['valid'] and self._filter_key == 'all' else '它已不符合目前的篩選，所以從清單消失。'))
+
+    def split_event(self):
+        """兩列車接連通過、被程式當成同一筆時，人工拆成兩筆（#125）。
+        第 1 筆：原本的車頭到達～輸入的「第 1 筆車尾離開」；第 2 筆：輸入的「第 2 筆車頭到達」～原本的車尾離開。
+        不重新產生截圖與短片：車頭截圖給第 1 筆、車尾截圖給第 2 筆，短片兩筆共用（同一段影片包含兩列車）"""
+        i, e = self._sel_event()
+        if e is None:
+            messagebox.showinfo(APP, '請先在清單選一筆要拆開的列車。')
+            return
+        if not e['valid']:
+            messagebox.showinfo(APP, '已排除的事件不能拆開；如果是列車，請先改為「是列車」。')
+            return
+        if self._media_busy():
+            return
+        w = tk.Toplevel(self.root)
+        w.title('拆成兩筆')
+        w.transient(self.root)
+        w.resizable(False, False)
+        g = ttk.Frame(w, padding=(16, 14, 16, 4)); g.pack(fill='both')
+        mid = core.fmt_time((e['start'] + e['end']) / 2)
+        v1, v2 = tk.StringVar(value=mid), tk.StringVar(value=mid)
+        ttk.Label(g, text='原本這一筆：%s ～ %s（%.1f 秒）' % (core.fmt_time(e['start']), core.fmt_time(e['end']), e['end'] - e['start'])
+                  ).grid(row=0, column=0, columnspan=2, sticky='w', pady=(0, 8))
+        ttk.Label(g, text='第 1 筆：車頭到達').grid(row=1, column=0, sticky='w', pady=3, padx=(0, 8))
+        ttk.Label(g, text=core.fmt_time(e['start'])).grid(row=1, column=1, sticky='w')
+        ttk.Label(g, text='第 1 筆：車尾離開').grid(row=2, column=0, sticky='w', pady=3, padx=(0, 8))
+        en1 = ttk.Entry(g, textvariable=v1, width=14); en1.grid(row=2, column=1, sticky='w')
+        ttk.Label(g, text='第 2 筆：車頭到達').grid(row=3, column=0, sticky='w', pady=3, padx=(0, 8))
+        ttk.Entry(g, textvariable=v2, width=14).grid(row=3, column=1, sticky='w')
+        ttk.Label(g, text='第 2 筆：車尾離開').grid(row=4, column=0, sticky='w', pady=3, padx=(0, 8))
+        ttk.Label(g, text=core.fmt_time(e['end'])).grid(row=4, column=1, sticky='w')
+        ttk.Label(g, style='Hint.TLabel', justify='left', text=(
+            '時間例：08:15:30.5。時間可以先關掉這個視窗，按「在影片中看這段」查好\n'
+            '（第 1 列車車尾離開、第 2 列車車頭到達參考線）。不會重新產生截圖與短片（短片兩筆共用）。')).grid(
+            row=5, column=0, columnspan=2, sticky='w', pady=(6, 0))
+        res = {}
+
+        def ok():
+            try:
+                t1 = self._parse_event_time(v1.get(), e['start'])
+                t2 = self._parse_event_time(v2.get(), e['start'])
+            except ValueError as ex:
+                messagebox.showerror(APP, '時間格式不對：%s' % ex, parent=w)
+                return
+            if not (e['start'] < t1 <= t2 < e['end']):
+                messagebox.showerror(APP, '時間要在這一筆的範圍內，而且：\n車頭到達 < 第 1 筆車尾離開 ≤ 第 2 筆車頭到達 < 車尾離開。', parent=w)
+                return
+            l1, l2 = self._locate(t1), self._locate(t2)
+            if l1 is None or l2 is None:
+                messagebox.showerror(APP, '%s 沒有對應的錄影畫面。' % core.fmt_time(t1 if l1 is None else t2), parent=w)
+                return
+            res.update(t1=t1, t2=t2, l1=l1, l2=l2)
+            w.destroy()
+        bar = ttk.Frame(w, padding=(16, 8, 16, 14)); bar.pack(fill='x')
+        ttk.Button(bar, text='取消', width=10, command=w.destroy).pack(side='right')
+        ttk.Button(bar, text='拆開', width=10, command=ok).pack(side='right', padx=(0, 8))
+        w.update_idletasks()
+        w.geometry('+%d+%d' % (max(0, self.root.winfo_rootx() + (self.root.winfo_width() - w.winfo_width()) // 2),
+                               max(0, self.root.winfo_rooty() + (self.root.winfo_height() - w.winfo_height()) // 3)))
+        w.grab_set()
+        en1.focus_set()
+        self.root.wait_window(w)
+        if not res:
+            return
+        self._do_split(e, res['t1'], res['t2'], res['l1'], res['l2'])
+
+    def _do_split(self, e, t1, t2, l1, l2):
+        import copy
+        e2 = copy.deepcopy({k: v for k, v in e.items() if not k.startswith('_')})
+        shots = list(e.get('shots') or [])
+        n = 1 + max([int(x['media_tag'][1:]) for x in self.events if str(x.get('media_tag', '')).startswith('S')
+                     and x['media_tag'][1:].isdigit()] + [0])
+        e2.update(start=t2, first_change=t2, start_file=l2[0], start_pos=l2[1], start_known=True,
+                  shots=[x for x in shots if '3' in os.path.basename(x)[:6] or '車尾' in x or '最後畫面' in x],
+                  media_tag='S%03d' % n)
+        e.update(end=t1, last_change=t1, end_file=l1[0], end_pos=l1[1], end_known=True,
+                 shots=[x for x in shots if '車頭' in x or '第一畫面' in x])
+        for x in (e, e2):
+            note = x.get('note') or ''
+            if '人工拆成兩筆' not in note:
+                x['note'] = (note + '；人工拆成兩筆').strip('；')
+        self.events.append(e2)
+        self._refresh_keep(e)
+        self.var_tab2msg.set('已拆成兩筆：%s～%s、%s～%s。修改完記得按「儲存修改並重新輸出 Excel」。' % (
+            core.fmt_time(e['start']), core.fmt_time(e['end']), core.fmt_time(e2['start']), core.fmt_time(e2['end'])))
 
     def set_dirty(self, v):
         self.dirty = v

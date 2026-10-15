@@ -68,6 +68,7 @@ class Profile:
     clip_after: float = 3.0               # 短片：事件後幾秒
     make_clips: bool = True
     make_shots: bool = True               # v1.0.18（#106）：截圖；和 make_clips 都 False＝不產生截圖與短片（最快）
+    shots_excluded_only: bool = False     # v1.0.21（#124）：只有程式判定為排除的事件做截圖（列車不做截圖、短片）
     osd_rect: list = dataclasses.field(default_factory=lambda: [14, 8, 204, 24])   # 時間字幕外框 [x0,y0,x1,y1]
     osd_format: str = 'YYYY-MM-DD HH:MM:SS'
     osd_templates: list = None            # 「教程式認字」學到的字樣；None＝內建
@@ -645,6 +646,7 @@ class Detector:
     EDGE_WINDOW = 1.5      # 事件開頭／結尾看幾秒
     HEAD_SEC = 60.0        # 方向判斷：保留事件開頭幾秒的逐格資料
     TAIL_SEC = 60.0        #           與最後幾秒（列車停很久也不會吃光記憶體，車頭／車尾的證據都在）
+    SHORT_SIDE = 20        # 參考線某一側的軌道範圍短於這個長度（沿軌道方向的像素）→ 不要求兩側同時有變化（#126）
 
     def __init__(self, profile: Profile, crop, occluded: bool = False, guard: bool = True):
         """occluded：遮擋判讀（參考線被隔音罩等擋住一部分時，用看得到的部分判讀，#115；process 會兩種同時跑、自動選）。
@@ -696,6 +698,11 @@ class Detector:
             if not len(rx):
                 raise ValueError('參考線未穿過軌道範圍')
             self.ref_idx=int(round(np.median(rx if self.horiz else ry)))
+        # 參考線靠近軌道範圍的一端（使用者自己決定參考線位置，#126）：短的那一側太短時，
+        # 「兩側同時有變化」量不準，不拿來排除（方向照樣判斷，判斷不出來就標方向不確定）
+        n_cols = (self.track_maps[0].shape[1] if self.horiz else self.track_maps[0].shape[0]) if self.track_maps is not None \
+            else ((self.tr[2] - self.tr[0]) if self.horiz else (self.tr[3] - self.tr[1]))
+        self.short_side = min(self.ref_idx - 3, n_cols - self.ref_idx - 3) < self.SHORT_SIDE
         self.bg = None
         self.hist = []          # 最近幾秒的 (t, 覆蓋向量)
         self.cur = None         # 進行中的事件
@@ -779,7 +786,7 @@ class Detector:
         # 被當成「陽光」而不算佔用，還把列車學成背景，列車只剩 0.1～0.3 秒（被排除）或整筆漏掉。
         # 但紋理幾乎完全一樣（相似度 ≥ light_cross_ncc）時，即使大範圍變亮變暗，仍是光線變化（整片雲影、假影片的陽光約 0.99；
         # 實測被遮住一部分的列車最高 0.73）
-        crossing = cov >= self.p.light_cross_cov and (both >= self.p.min_both or self.occluded)
+        crossing = cov >= self.p.light_cross_cov and (both >= self.p.min_both or self.occluded or self.short_side)
         if sat >= self.p.day_saturation and score > self.p.off_level:
             u = g[self.band]; v = self.bg[self.band]
             u = u - u.mean(); v = v - v.mean()
@@ -1140,7 +1147,7 @@ class Detector:
         elif c['coverage'] < self.p.min_coverage:
             ev['valid'] = False
             reasons.append('軌道範圍內變化範圍太小（%.0f%%，可能是汽車、行人或樹葉）' % (c['coverage'] * 100))
-        elif c.get('both', 0.0) < self.p.min_both and not self.occluded:
+        elif c.get('both', 0.0) < self.p.min_both and not self.occluded and not self.short_side:
             ev['valid'] = False
             reasons.append('只有參考線一側有變化，沒有東西橫跨參考線（可能是車燈照射或路上的車）')
         if c.get('incomplete'):
@@ -1641,10 +1648,11 @@ def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None,
         ev['tag'] = ev.get('media_tag') or ('%03d' % ev['no'] if ev.get('valid') else 'X%03d' % ev['no'])
         ev['media_tag'] = ev['tag']
         ev['shots'], ev['clip'] = [], ''
+        ev_shots = make_shots and not (getattr(profile, 'shots_excluded_only', False) and ev.get('valid'))
         # 車頭／車尾未確認時，截圖名稱不寫「車頭／車尾」，避免人工覆核時誤以為是確定的時間（#70）
-        if make_shots:            # 只要短片時不存截圖（#106）
+        if ev_shots:              # 只要短片時不存截圖（#106）；只有已排除的做截圖時，列車不存（#124）
             shots[ev['start_file']].append((ev['start_pos'], ev, '1車頭' if ev.get('start_known', True) else '1第一畫面_車頭未確認'))
-        if not make_shots:
+        if not ev_shots:
             pass
         elif ev.get('valid') or not ev.get('peak_file'):
             m = _at(tl, order, (ev['start'] + ev['end']) / 2)
@@ -1653,7 +1661,7 @@ def save_frames_and_clips(events, profile: Profile, out_dir: str, progress=None,
             shots[m[0]].append((m[1], ev, '2中間'))
         else:
             shots[ev['peak_file']].append((ev['peak_pos'], ev, '2變化最大'))
-        if make_shots:
+        if ev_shots:
             shots[ev['end_file']].append((ev['end_pos'], ev, '3車尾' if ev.get('end_known', True) else '3最後畫面_車尾未確認'))
         if profile.make_clips and ev.get('valid'):
             a, b = ev['start'] - profile.clip_before, ev['end'] + profile.clip_after
