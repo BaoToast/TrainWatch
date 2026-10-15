@@ -182,3 +182,7 @@ TW_SAMPLES=D:\樣本影片 python -m unittest discover -s tests -v
 1. 改 `trainwatch/gui.py` 的 `VERSION`。
 2. 上傳到 GitHub（main）→ Actions 自動跑單元測試、組出免安裝資料夾、檢查 Python 數位簽章，再用資料夾裡的 Python 跑 `--selftest` 並實際開一次視窗。
 3. Actions 該次執行頁面最下方 Artifacts 下載 `TrainWatch_v版本_windows.zip`（只包一層，解壓縮一次）；推送 `v1.0.1` 這種標籤則另外建立 Release。
+
+GitHub 上自動打包時，較慢的測試（長時間停車、交會、攝影機、陽光等，約 27 項）會略過，打包幾分鐘就完成。
+要在自己電腦完整跑全部測試：設定環境變數 `TW_FULL=1` 再執行 `python -m unittest discover -s tests`。
+舊樣本影片的測試（`TW_SAMPLES`）沒有樣本資料夾時會略過。

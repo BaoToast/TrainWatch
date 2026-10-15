@@ -15,15 +15,17 @@ import traceback
 from tkinter import filedialog, messagebox, simpledialog, ttk
 from tkinter import font as tkfont
 
+import numpy as np
 from PIL import Image, ImageTk
 
 from . import core, export, osd
 from .core import Profile
 
-VERSION = '1.0.18'
+VERSION = '1.0.20'
 APP = '列車通過判讀'
 VIDEO_TYPES = [('影片', '*.mkv *.mp4 *.avi *.mov *.ts *.h264 *.264 *.dav'), ('所有檔案', '*.*')]
 
+CORNER_PICK = 10          # 按在軌道範圍的角附近幾個畫面像素內＝拖曳那個角（#114）
 CANVAS_W, CANVAS_H = 900, 506      # 第 1 頁影片畫面的「建議」大小；實際大小跟著視窗縮放
 # 每一頁內容的最小尺寸：視窗比這個小時出現捲軸，內容不會被切掉（v1.0.7）
 TAB_MIN = {1: (0, 0), 2: (0, 0)}       # 0＝依內容實際需要的大小
@@ -34,7 +36,8 @@ SEC_PER_VIDEO_MIN = (1.0, 2.0)   # 預估：每 1 分鐘影片判讀約需幾秒
 # 進階設定的合理範圍（超出範圍不給存）
 PARAM_RANGE = dict(on_level=(3, 100), off_level=(1, 99), pixel_diff=(3, 120), merge_gap=(0.1, 10),
                    min_duration=(0.1, 10), min_coverage=(0.01, 1.0), min_both=(0.0, 1.0), static_sec=(1, 600),
-                   max_static=(60, 86400), long_event=(10, 86400), clip_before=(0, 30), clip_after=(0, 30))
+                   max_static=(60, 86400), long_event=(10, 86400), clip_before=(0, 30), clip_after=(0, 30),
+                   ref_height=(0, 50))
 
 
 def app_dir():
@@ -337,7 +340,7 @@ def overlay_image(frame, profile, width=420):
         frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
     im = frame.copy()
     x0, y0, x1, y1 = [int(v) for v in profile.track_rect]
-    cv2.rectangle(im, (x0, y0), (x1, y1), (0, 160, 255), 2)
+    cv2.polylines(im,[__import__('numpy').rint(profile.track_points()).astype('int32')],True,(0,160,255),2)
     (xa, ya), (xb, yb) = profile.ref_line
     cv2.line(im, (int(xa), int(ya)), (int(xb), int(yb)), (32, 32, 255), max(2, int(profile.ref_width)))
     h, w = im.shape[:2]
@@ -356,6 +359,11 @@ def apply_camera_info(info, files, timing):
         txt = [n['text'] for n in info.get('notes', ()) if n.get('file') == f]
         if txt:
             t['cam_note'] = '；'.join(txt)
+    oc = info.get('occlusion') or {}
+    if oc.get('used'):                                   # #115：程式自動改用遮擋判讀，要讓使用者知道
+        for t in timing:
+            t['note'] = ('程式判斷參考線被隔音罩等擋住一部分（一般判讀只找到 %d 筆、看得到的部分找到 %d 筆），\n'
+                         '這次改用看得到的部分判讀。建議之後把參考線畫在沒有遮擋的位置。' % (oc.get('normal', 0), oc.get('occluded', 0)))
 
 
 def mark_time_jumps(evs, files, timing):
@@ -451,7 +459,7 @@ class App:
         self.root = root
         root.title('%s v%s' % (APP, VERSION))
         self._fonts()
-        self.profile = Profile()
+        self.profile = Profile(passing_only=True)   # 新監測站預設：列車短暫通過（#116）
         self.files = []            # [{'path','info','osd': dict|None,'manual': datetime|None,'state': str}]
         self.events = []
         self.result_dir = ''
@@ -650,6 +658,13 @@ class App:
         self._lk(ttk.Radiobutton(r, text='軌道範圍（橘）', value='track', variable=self.mode)).pack(side='left', padx=3)
         self._lk(ttk.Radiobutton(r, text='時間字幕位置（藍）', value='osd', variable=self.mode)).pack(side='left', padx=3)
 
+        r=ttk.Frame(right); r.pack(fill='x')
+        ttk.Label(r,text='軌道範圍：先框出長方形，再拖曳四個角沿著軌道調整；紅線只判讀橘框內的部分',
+                  style='Hint.TLabel').pack(side='left')
+        r=ttk.Frame(right); r.pack(fill='x')
+        self.var_longstop=tk.BooleanVar(value=not self.profile.passing_only)
+        self._lk(ttk.Checkbutton(r,text='如果列車有可能長停車，請打勾',variable=self.var_longstop,command=self.set_longstop)).pack(side='left')
+        ttk.Label(r,text='（火車可能停在參考線上時勾；捷運不用勾）',style='Hint.TLabel').pack(side='left',padx=4)
         self.cw, self.ch = CANVAS_W, CANVAS_H
         self.canvas = tk.Canvas(right, width=480, height=270, bg='#202020', highlightthickness=0, cursor='crosshair')
         self.canvas.bind('<Configure>', self._on_canvas_size)
@@ -701,6 +716,7 @@ class App:
         ttk.Button(top, text='開啟先前的結果…', command=self.open_results).pack(side='left')
         ttk.Button(top, text='手動新增列車…', command=self.manual_add).pack(side='left', padx=(6, 0))
         ttk.Button(top, text='開啟結果資料夾', command=lambda: self.result_dir and open_path(self.result_dir)).pack(side='right')
+        ttk.Button(top,text='合併噪音分析 TXT…',command=self.merge_noise).pack(side='right',padx=4)
         ttk.Button(top, text='輸出噪音分析用 TXT', command=self.export_noise).pack(side='right', padx=(6, 6))
         ttk.Button(top, text='儲存修改並重新輸出 Excel', style='Big.TButton', command=self.save_results).pack(side='right', padx=6)
 
@@ -734,7 +750,7 @@ class App:
         for c, h, w in zip(cols, heads, widths):
             self.tv.heading(c, text=h)
             self.tv.column(c, width=w, minwidth=w if c == 'reason' else 20,
-                           anchor='w' if c in ('reason', 'type') else 'center', stretch=(c == 'reason'))
+                           anchor='w' if c in ('reason', 'type') else 'center', stretch=False)
         hsb = ttk.Scrollbar(lf, orient='horizontal', command=self.tv.xview)
         hsb.pack(side='bottom', fill='x')
         sb = ttk.Scrollbar(lf, orient='vertical', command=self.tv.yview)
@@ -778,6 +794,11 @@ class App:
         ttk.Checkbutton(g, text='已人工確認', variable=self.var_checked).grid(row=2, column=3, sticky='w')
         ttk.Label(g, text='備註').grid(row=3, column=0, sticky='w', pady=2)
         ttk.Entry(g, textvariable=self.var_note, width=40).grid(row=3, column=1, columnspan=3, sticky='we', padx=4)
+        # 系統備註完整顯示在這裡（清單裡太長看不完，#120）
+        ttk.Label(g, text='系統備註').grid(row=4, column=0, sticky='nw', pady=2)
+        self.var_reason = tk.StringVar(value='')
+        ttk.Label(g, textvariable=self.var_reason, style='Hint.TLabel', wraplength=380, justify='left'
+                  ).grid(row=4, column=1, columnspan=3, sticky='w', padx=4, pady=2)
         r = ttk.Frame(ed); r.pack(fill='x', padx=8, pady=(0, 8))
         ttk.Button(r, text='套用修改', command=self.apply_edit).pack(side='left')
         self.btn_valid = ttk.Button(r, text='改為「不是列車」', command=self.toggle_valid)
@@ -881,6 +902,7 @@ class App:
             return []
 
     def _collect_profile(self):
+        self.profile.passing_only = not bool(self.var_longstop.get())
         self.profile.name = self.var_name.get().strip() or '未命名監測站'
         try:
             self.profile.ref_width = max(3, min(25, int(self.var_width.get())))
@@ -891,6 +913,7 @@ class App:
     def _apply_profile_to_ui(self):
         self.var_name.set(self.profile.name)
         self.var_width.set(self.profile.ref_width)
+        self.var_longstop.set(not self.profile.passing_only)
         self.redraw_overlay()
         self.update_osd_label()
 
@@ -903,7 +926,7 @@ class App:
         fr = self.cur_frame
         if fr is None:
             return ''
-        geom = (json.dumps(p.ref_line), json.dumps(p.track_rect))
+        geom = (json.dumps(p.ref_line), json.dumps(p.track_points().round(1).tolist()))
         changed = geom != getattr(self, '_loaded_geom', geom)
         plan = core.plan_anchor_save(p, fr, changed)
         v = plan['verdict']
@@ -975,7 +998,7 @@ class App:
             messagebox.showerror(APP, '讀取設定失敗：%s' % e)
             return
         self.cb_prof.set(name)
-        self._loaded_geom = (json.dumps(self.profile.ref_line), json.dumps(self.profile.track_rect))
+        self._loaded_geom = (json.dumps(self.profile.ref_line), json.dumps(self.profile.track_points().round(1).tolist()))
         self._apply_profile_to_ui()
         self._remember(name)
         self.var_status.set('已載入監測站設定：%s' % self.profile.name)
@@ -1030,7 +1053,8 @@ class App:
                  ('max_static', '完全不動多久標需確認（秒）', '預設 1800＝30 分鐘；只標記，事件照樣等車開走才結束'),
                  ('long_event', '很長的佔用（秒）', '超過只標記需確認'),
                  ('clip_before', '短片：事件前秒數', ''),
-                 ('clip_after', '短片：事件後秒數', '')]
+                 ('clip_after', '短片：事件後秒數', ''),
+                 ('ref_height', '參考線被擋住時往上補償（像素）', '程式判斷參考線被隔音罩等擋住一部分時，往上包含看得到的車身')]
         vars_ = {}
         for i, (k, lab, hint) in enumerate(items):
             ttk.Label(w, text=lab).grid(row=i, column=0, sticky='w', padx=10, pady=3)
@@ -1072,7 +1096,7 @@ class App:
                 messagebox.showerror(APP, '時間字幕格式不對：%s' % e, parent=w)
                 return
             for k, v in vals.items():
-                setattr(p, k, v)
+                setattr(p, k, int(round(v)) if k == 'ref_height' else v)
             p.osd_format = vf.get()
             if vt.get():
                 p.osd_templates = None
@@ -1377,7 +1401,7 @@ class App:
         x0, y0, x1, y1 = self.profile.osd_rect
         c.create_rectangle(x0 * s, y0 * s, x1 * s, y1 * s, outline='#30a0ff', width=2, tags='ov')
         x0, y0, x1, y1 = self.profile.track_rect
-        c.create_rectangle(x0 * s, y0 * s, x1 * s, y1 * s, outline='#ffa000', width=2, tags='ov')
+        c.create_polygon(*(self.profile.track_points()*s).ravel().tolist(),outline='#ffa000',fill='',width=2,tags='ov')
         try:
             wd = max(3, min(25, int(self.var_width.get())))
         except (tk.TclError, ValueError):
@@ -1385,7 +1409,11 @@ class App:
         (xa, ya), (xb, yb) = self.profile.ref_line
         c.create_line(xa * s, ya * s, xb * s, yb * s, fill='#ff2020', width=max(2, wd * s), tags='ov')
         fnt = (self.font_family, 10, 'bold')
-        c.create_text(x0 * s + 4, y0 * s - 3, text='軌道範圍', fill='#ffa000', anchor='sw', tags='ov', font=fnt)
+        tp = self.profile.track_points()                  # 文字放在最上面的角（#112）
+        for qx, qy in tp:                                  # 四個角的小方塊，可以拖曳（#114）
+            c.create_rectangle(qx * s - 4, qy * s - 4, qx * s + 4, qy * s + 4, outline='#ffffff', fill='#ffa000', width=1, tags='ov')
+        tx, ty = tp[int(tp[:, 1].argmin())]
+        c.create_text(tx * s + 4, max(12, ty * s - 3), text='軌道範圍', fill='#ffa000', anchor='sw', tags='ov', font=fnt)
         c.create_text(max(xa, xb) * s + max(2, wd * s) / 2 + 4, min(ya, yb) * s - 3, text='參考線', fill='#ff4040',
                       anchor='sw', tags='ov', font=fnt)
 
@@ -1393,6 +1421,13 @@ class App:
         s = self.disp_scale
         h, w = self.cur_frame.shape[:2]
         return [int(max(0, min(w - 1, e.x / s))), int(max(0, min(h - 1, e.y / s)))]
+
+    def set_longstop(self):
+        """「如果列車有可能長停車，請打勾」（#116）：不勾＝短暫通過（比較不受日照影響）；勾＝一般模式的長停車保護"""
+        if self._run_lock_on:
+            self.var_longstop.set(not self.profile.passing_only)
+            return
+        self.profile.passing_only = not bool(self.var_longstop.get())
 
     def on_press(self, e):
         if self.cur_frame is None:
@@ -1402,6 +1437,15 @@ class App:
             self.var_status.set('判讀中不能修改參考線、軌道範圍、時間字幕位置（判讀完成或取消後恢復）。')
             return
         self.drag = self._to_video(e)
+        self.drag_corner = None
+        if self.mode.get() == 'track':             # 按在四個角的小方塊上＝拖曳那個頂點（#114）
+            s = self.disp_scale
+            pts = self.profile.track_points()
+            d = np.hypot(pts[:, 0] * s - e.x, pts[:, 1] * s - e.y)
+            i = int(d.argmin())
+            if d[i] <= CORNER_PICK:
+                self.drag_corner = i
+                self.profile.track_quad = pts.round(1).tolist()
 
     def on_drag(self, e):
         if self.cur_frame is None or self.drag is None:
@@ -1411,8 +1455,14 @@ class App:
         m = self.mode.get()
         if m == 'ref':
             self.profile.ref_line = [list(self.drag), p]
+        elif m == 'track' and getattr(self, 'drag_corner', None) is not None:
+            q = [list(map(float, v)) for v in self.profile.track_points().tolist()]
+            q[self.drag_corner] = [float(p[0]), float(p[1])]
+            self.profile.track_quad = q
         elif m == 'track':
-            self.profile.track_rect = box
+            self.profile.track_rect = box          # 重新框長方形：四個角回到長方形的角
+            self.profile.track_quad = None
+            self.profile.track_angle = 0.0
         else:
             self.profile.osd_rect = box
         self.redraw_overlay()
@@ -1424,6 +1474,7 @@ class App:
             self.profile.frame_size = [int(self.cur_frame.shape[1]), int(self.cur_frame.shape[0])]
         self.on_drag(e)
         self.drag = None
+        self.drag_corner = None
         if self.mode.get() == 'osd':
             self.update_osd_label()
             self.var_status.set('時間字幕位置已更新；確認「畫面時間判讀」和畫面上一樣後，按「儲存」。')
@@ -1435,13 +1486,29 @@ class App:
     def check_geometry(self):
         p = self.profile
         (xa, ya), (xb, yb) = p.ref_line
-        x0, y0, x1, y1 = p.track_rect
         if abs(xb - xa) + abs(yb - ya) < 8:
             return '參考線太短，請拖曳畫一條橫過軌道的線。'
-        if (x1 - x0) < 20 or (y1 - y0) < 8:
+        tw, th, _, _ = p.track_axes()
+        if max(tw, th) < 20 or min(tw, th) < 8:
             return '軌道範圍太小，請沿軌道框大一點。'
-        rp = p.ref_pos()
-        lo, hi = (x0, x1) if p.horizontal() else (y0, y1)
+        bad = p.quad_problem()
+        if bad:
+            return bad
+        h, w = self.cur_frame.shape[:2] if self.cur_frame is not None else (100000, 100000)
+        pts = p.track_points()
+        if (pts < -0.5).any() or (pts[:, 0] > w - 0.5).any() or (pts[:, 1] > h - 0.5).any():
+            return '軌道範圍超出影片，請把四個角拉回畫面內。'
+        try:
+            det = core.Detector(p, core.work_crop(p, w, h))
+        except ValueError as ex:
+            return str(ex)
+        if det.track_maps is not None:
+            n = det.track_maps[0].shape[1] if p.horizontal() else det.track_maps[0].shape[0]
+            rp, lo, hi = det.ref_idx, 0, n
+        else:
+            x0, y0, x1, y1 = p.track_bounds()
+            rp = p.ref_pos()
+            lo, hi = (x0, x1) if p.horizontal() else (y0, y1)
         if not (lo + 15 < rp < hi - 15):
             return '參考線要在軌道範圍中間（兩側都要留一段），方向才判斷得出來。'
         return ''
@@ -1625,7 +1692,14 @@ class App:
             if self.cancel_flag:
                 self.q.put(('stop', '已取消。', out))
                 return
-            need = [c for c in chk if c['verdict'] in ('moved', 'none', 'uncertain')]
+            # #117：只有量到攝影機大幅移動（參考線可能失效）才請使用者確認；
+            # 沒有位置基準（舊設定、還沒儲存）→ 自動記住這批影片的畫面，不打擾使用者；比對不起來 → 略過
+            auto = [c for c in chk if c['verdict'] == 'none']
+            for c in auto:
+                prof.camera_anchors = core.add_anchor(prof.camera_anchors, core.make_anchor(c['frame'], note='判讀前自動記住'), prof)
+            if auto:
+                self.q.put(('anchors', prof.camera_anchors))
+            need = [c for c in chk if c['verdict'] == 'moved']
             if need:
                 ev, ans = threading.Event(), {}
                 self.q.put(('ask_pos', need, prof, ev, ans))
@@ -1653,7 +1727,7 @@ class App:
             core.save_frames_and_clips(evs, prof, out, prog2, lambda: self.cancel_flag, files=files, bases=bases)
             for t in timing:
                 if sorted_note:
-                    t.setdefault('note', sorted_note)
+                    t['note'] = (t['note'] + '\n' + sorted_note) if t.get('note') else sorted_note
             export.save_json(os.path.join(out, 'results.json'), evs, prof, files, timing, VERSION)
             export.write_excel(os.path.join(out, '列車通過紀錄.xlsx'), evs, prof, files, timing)
             export.write_csv(os.path.join(out, '列車通過紀錄.csv'), evs)
@@ -1921,7 +1995,7 @@ class App:
         try:
             with open(path, encoding='utf-8') as fh:
                 d = json.load(fh)
-            if d.get('ref_line') != p.ref_line or d.get('track_rect') != p.track_rect:
+            if (d.get('ref_line') != p.ref_line or Profile.from_dict(d).track_points().round(1).tolist() != p.track_points().round(1).tolist()):
                 return
             d['camera_anchors'], d['profile_version'] = p.camera_anchors, 2
             tmp = path + '.tmp'
@@ -2061,7 +2135,22 @@ class App:
             tags = ('need',) if need else (('excl',) if not e['valid'] else ())
             self.tv.insert('', 'end', iid=str(i), values=vals, tags=tags + (('picked',) if e.get('_pick') else ()))
         self.var_sum.set('列車 %d 筆（需確認 %d）、已排除 %d 筆' % (nv, nn, nx))
+        self._fit_columns()
         self._upd_pick()
+
+    def _fit_columns(self):
+        """欄寬跟著字型與內容：時間欄放得下「00:00:00.0」；備註欄放得下最長的一筆，
+        太長時用清單下方的水平捲軸往右看（#120、#121；以前備註欄跟著視窗寬度，超出的字看不到也捲不過去）"""
+        try:
+            f = tkfont.nametofont(ttk.Style().lookup('Treeview', 'font') or 'TkDefaultFont')
+        except tk.TclError:
+            f = tkfont.nametofont('TkDefaultFont')
+        tw = f.measure('00:00:00.0') + 16
+        for c in ('start', 'end'):
+            self.tv.column(c, width=max(86, tw))
+        self.tv.column('date', width=max(56, f.measure('00-00') + 16))
+        longest = max([f.measure(str(self.tv.set(i, 'reason'))) for i in self.tv.get_children()] or [0])
+        self.tv.column('reason', width=max(240, min(4000, longest + 24)))
 
     # ---- 勾選多筆一次修改（#105）：勾選只在畫面上，不存進結果（匯出只寫固定欄位）
     def _upd_pick(self):
@@ -2168,6 +2257,7 @@ class App:
         self.var_dir.set(e.get('direction', '')); self.var_type.set(e.get('train_type', ''))
         self.var_cross.set(bool(e.get('crossing'))); self.var_checked.set(bool(e.get('checked')))
         self.var_note.set(e.get('note', ''))
+        self.var_reason.set((e.get('reason', '') or '（無）').replace(' ', '\u00a0'))   # 不在空格處換行，一行排滿
         self.btn_valid.configure(text='改為「不是列車」' if e['valid'] else '改為「是列車」')
         has_peak = any('2變化最大' in x for x in (e.get('shots') or []))
         self.shot_btns[1].configure(text='變化最大' if has_peak else '中間')
@@ -2466,6 +2556,21 @@ class App:
             return
         self.set_dirty(False)
         messagebox.showinfo(APP, '已儲存：\n%s' % os.path.join(self.result_dir, '列車通過紀錄.xlsx'))
+
+    def merge_noise(self):
+        paths=filedialog.askopenfilenames(title='選擇要合併的噪音分析 TXT（可多選）',filetypes=[('TXT','*.txt'),('所有檔案','*.*')])
+        if not paths: return
+        try: lines,removed=export.merge_noise_lines(paths)
+        except Exception as ex:
+            messagebox.showerror(APP,str(ex)); return
+        path=filedialog.asksaveasfilename(title='另存合併結果',initialfile='列車時間_合併.txt',defaultextension='.txt',filetypes=[('TXT','*.txt')])
+        if not path: return
+        if os.path.normcase(os.path.abspath(path)) in [os.path.normcase(os.path.abspath(p)) for p in paths]:
+            messagebox.showerror(APP,'請使用新的檔名，保留原始 TXT。'); return
+        try: export.write_noise_lines(path,lines)
+        except Exception as ex:
+            messagebox.showerror(APP,'寫入失敗：%s'%ex); return
+        messagebox.showinfo(APP,'已合併 %d 筆，移除 %d 筆完全重複資料。\n%s'%(len(lines),removed,path))
 
     def export_noise(self):
         """噪音分析程式用的記事本檔：日期,進入時間,離開時間,10,FR,,A（只含「是列車」的）"""

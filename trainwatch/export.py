@@ -133,7 +133,8 @@ def write_excel(path, events, profile: Profile, files, timing):
             ['監測站', profile.name],
             ['參考線（x1,y1,x2,y2）', str(sum(profile.ref_line, []))],
             ['參考線寬度', profile.ref_width],
-            ['軌道範圍（x0,y0,x1,y1）', str(list(profile.track_rect))],
+            ['軌道範圍四個頂點（x,y）', str([[round(float(a), 1), round(float(b), 1)] for a, b in profile.track_points().tolist()])],
+            ['列車有可能長停車', '否（短暫通過）' if profile.passing_only else '是'],
             ['時間字幕位置（x0,y0,x1,y1）', str(list(profile.osd_rect))],
             ['時間字幕格式', profile.osd_format],
             ['佔用門檻（開始／結束）', '%s／%s' % (profile.on_level, profile.off_level)],
@@ -210,3 +211,40 @@ def write_noise_txt(path, events):
     os.replace(tmp, path)
     return len(lines)
 
+
+
+def merge_noise_lines(paths):
+    """Strict row validation; normalize encoding/blank lines/order/exact duplicates."""
+    import re
+    found=[]
+    for path in paths:
+        with open(path,'rb') as fh:
+            raw=fh.read()
+        if raw.startswith((b'\xff\xfe',b'\xfe\xff')): text=raw.decode('utf-16')
+        else:
+            try: text=raw.decode('utf-8-sig')
+            except UnicodeDecodeError: text=raw.decode('cp950')
+        for no,line in enumerate(text.splitlines(),1):
+            line=line.strip().lstrip('\ufeff')
+            if not line: continue
+            if not re.fullmatch(r'\d{4}/\d{2}/\d{2},\d{2}:\d{2}:\d{2},\d{2}:\d{2}:\d{2},10,FR,,A',line):
+                raise ValueError('%s 第 %d 行格式不符：應為日期,進入時間,離開時間,10,FR,,A'%(os.path.basename(path),no))
+            cols=line.split(',')
+            try:
+                a=dt.datetime.strptime(cols[0]+','+cols[1],'%Y/%m/%d,%H:%M:%S')
+                b=dt.datetime.strptime(cols[0]+','+cols[2],'%Y/%m/%d,%H:%M:%S')
+            except ValueError as ex:
+                raise ValueError('%s 第 %d 行日期或時間不存在'%(os.path.basename(path),no)) from ex
+            if b<a and a.hour!=23:
+                raise ValueError('%s 第 %d 行離開時間早於進入時間，請確認'%(os.path.basename(path),no))
+            found.append(line)
+    lines=sorted(set(found))
+    if not lines: raise ValueError('選擇的檔案沒有列車紀錄')
+    return lines,len(found)-len(lines)
+
+
+def write_noise_lines(path,lines):
+    tmp=path+'.tmp'
+    with open(tmp,'wb') as fh:
+        fh.write(('\r\n'.join(lines)+'\r\n').encode('ascii'))
+    os.replace(tmp,path)

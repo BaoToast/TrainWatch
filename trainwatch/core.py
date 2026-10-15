@@ -40,6 +40,12 @@ class Profile:
     ref_line: list = dataclasses.field(default_factory=lambda: [[350, 165], [350, 215]])  # [[x1,y1],[x2,y2]]（影片原始像素）
     ref_width: int = 7                    # 參考線判讀寬度（像素）
     track_rect: list = dataclasses.field(default_factory=lambda: [200, 160, 470, 220])   # [x0,y0,x1,y1]
+    passing_only: bool = False            # 短暫通過場景：持續追蹤背景，避免日照殘差凍結整晚
+    ref_height: int = 20                  # 參考線被擋住一部分時：往上包含看得到的車身幾像素（只用在遮擋判讀，0＝不加寬）
+    occluded_track: bool = False         # v1.0.19 的「參考線一側被隔音罩遮擋」勾選；v1.0.20 起程式自動判斷（#115），這個欄位不再使用
+    track_angle: float = 0.0             # v1.0.19 的旋轉角度（舊設定相容用；有 track_quad 時不使用）
+    track_quad: list = None              # v1.0.20（#114）：軌道範圍四個頂點 [[x,y]×4]（左上、右上、右下、左下的順序）；None＝用 track_rect
+    camera_tolerance: float = 20.0       # 只有明確的大幅偏移才標記（原始影片像素）
     on_level: float = 15.0                # 參考線變化量超過 → 佔用
     off_level: float = 10.0               # 低於 → 視為沒有佔用（遲滯）
     pixel_diff: float = 25.0              # 單一像素和背景差多少算「有變化」
@@ -85,10 +91,69 @@ class Profile:
             p.profile_version = 1             # v1.0.12 以前存的：沒有攝影機位置基準
         return p
 
+    def track_points(self):
+        """軌道範圍的四個頂點（順序：畫框時的左上、右上、右下、左下）"""
+        q = self.track_quad
+        if isinstance(q, (list, tuple)) and len(q) == 4:
+            return np.float32(q)
+        x0, y0, x1, y1 = self.track_rect
+        pts = np.float32([[x0,y0],[x1,y0],[x1,y1],[x0,y1]])
+        a = math.radians(float(self.track_angle))
+        R = np.float32([[math.cos(a),-math.sin(a)],[math.sin(a),math.cos(a)]])
+        c = np.float32([(x0+x1)/2,(y0+y1)/2])
+        return (pts-c) @ R.T+c
+
+    def track_bounds(self):
+        pts = self.track_points()
+        return [int(math.floor(pts[:,0].min())),int(math.floor(pts[:,1].min())),
+                int(math.ceil(pts[:,0].max())),int(math.ceil(pts[:,1].max()))]
+
+    def track_axes(self):
+        """四邊形拉直成長條後的大小與兩個邊的方向：(寬, 高, 寬方向向量, 高方向向量)"""
+        p = self.track_points().astype(np.float64)
+        u = (p[1] - p[0]) + (p[2] - p[3])
+        v = (p[3] - p[0]) + (p[2] - p[1])
+        w = (np.linalg.norm(p[1] - p[0]) + np.linalg.norm(p[2] - p[3])) / 2
+        h = (np.linalg.norm(p[3] - p[0]) + np.linalg.norm(p[2] - p[1])) / 2
+        return w, h, u / (np.linalg.norm(u) + 1e-9), v / (np.linalg.norm(v) + 1e-9)
+
+    def track_is_rect(self):
+        """軌道範圍是沒旋轉、沒變形的正長方形（舊版的判讀方式，不用拉直）"""
+        p = self.track_points()
+        x0, x1 = float(p[:, 0].min()), float(p[:, 0].max())
+        y0, y1 = float(p[:, 1].min()), float(p[:, 1].max())
+        corners = np.float32([[x0, y0], [x1, y0], [x1, y1], [x0, y1]])
+        return bool(np.abs(p - corners).max() < 0.5)
+
+    def quad_problem(self):
+        """四個頂點有問題時回傳說明（交叉、往內凹、太小），沒問題回傳空字串"""
+        p = self.track_points().astype(np.float64)
+        cr = []
+        for i in range(4):
+            a, b, c = p[i], p[(i + 1) % 4], p[(i + 2) % 4]
+            cr.append((b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0]))
+        if not (all(x > 1e-6 for x in cr) or all(x < -1e-6 for x in cr)):
+            return '軌道範圍的四個頂點交叉或往內凹，請拖曳頂點成為凸的四邊形（像一般的長方形、梯形、平行四邊形）。'
+        w, h, _, _ = self.track_axes()
+        if min(w, h) < 4:
+            return '軌道範圍太窄，請把頂點拉開一點。'
+        return ''
+
     def horizontal(self):
         """軌道是左右走向（寬大於高）→ 方向寫往左／往右；否則寫往上／往下"""
-        x0, y0, x1, y1 = self.track_rect
-        return abs(x1 - x0) >= abs(y1 - y0)
+        if self.track_quad is None and abs(self.track_angle) < 1e-6:
+            x0, y0, x1, y1 = self.track_rect
+            return abs(x1 - x0) >= abs(y1 - y0)
+        w, h, _, _ = self.track_axes()
+        return w >= h
+
+    def direction_label(self, sign):
+        _, _, u, v = self.track_axes()
+        vx, vy = (u if self.horizontal() else v)
+        vx,vy = vx*sign,vy*sign
+        if abs(vx)>=abs(vy):
+            return '往右' if vx>0 else '往左'
+        return '往下' if vy>0 else '往上'
 
     def ref_pos(self):
         """參考線在軌道方向上的位置（左右走向用 x，上下走向用 y）"""
@@ -137,7 +202,7 @@ def osd_box(profile, k=1, pad=8):
 
 def _geo_mask(profile, w, h):
     m = np.full((h, w), 255, np.uint8)
-    x0, y0, x1, y1 = profile.track_rect
+    x0, y0, x1, y1 = profile.track_bounds()
     m[max(0, int(min(y0, y1)) - 20):int(max(y0, y1)) + 21, max(0, int(min(x0, x1)) - 20):int(max(x0, x1)) + 21] = 0
     m[:40] = 0                     # 上方（多數攝影機的時間字幕在這裡）
     a, b, c, d = osd_box(profile)
@@ -148,8 +213,8 @@ def _geo_mask(profile, w, h):
 def geo_points(profile):
     """要確認位置的點：參考線兩端與中點、軌道範圍四個角"""
     (xa, ya), (xb, yb) = profile.ref_line
-    x0, y0, x1, y1 = profile.track_rect
-    return np.float32([[xa, ya], [xb, yb], [(xa + xb) / 2, (ya + yb) / 2], [x0, y0], [x1, y0], [x0, y1], [x1, y1]])
+    x0, y0, x1, y1 = profile.track_bounds()
+    return np.float32([[xa, ya], [xb, yb], [(xa + xb) / 2, (ya + yb) / 2], *profile.track_points().tolist()])
 
 
 def geo_features(frame_bgr, profile):
@@ -191,11 +256,13 @@ def geo_disp(off):
     return float(np.max(np.hypot(off[:, 0], off[:, 1]))) if off is not None else None
 
 
-def geo_verdict(res, off=None):
+def geo_verdict(res, off=None, tolerance=None):
     """same／moved／uncertain（比不起來、或偏移在 3～6 像素之間 → 無法確認）"""
     if res is None:
         return 'uncertain'
     d = geo_disp(res['off'] if off is None else off)
+    if tolerance is not None:
+        return 'moved' if d >= tolerance else 'same'
     return 'same' if d < GEO_SAME else ('moved' if d >= GEO_MOVE else 'uncertain')
 
 
@@ -252,7 +319,7 @@ def plan_anchor_save(profile, frame, geom_changed, confirmed=False):
         return dict(verdict='new', anchors=[new], disp=None)
     feats = geo_features(frame, profile)
     res = [geo_compare(geo_features(anchor_image(a), profile), feats, profile) for a in olds]
-    verds = [geo_verdict(r) for r in res]
+    verds = [geo_verdict(r,tolerance=profile.camera_tolerance) for r in res]
     if geom_changed:
         keep = [a for a, v in zip(olds, verds) if v == 'same']
         return dict(verdict='new', anchors=add_anchor(keep, new, profile) if keep else [new], disp=None)
@@ -317,7 +384,7 @@ def check_start(files, profile, progress=None, cancel=None):
             res, v = None, 'none'
         else:
             res, _bi = best_anchor(feats, anchors, profile)
-            v = geo_verdict(res)
+            v = geo_verdict(res,tolerance=profile.camera_tolerance)
         out.append(dict(file=f, pos=pos, mode=m, verdict=v, n=res['n'] if res else 0,
                         disp=round(geo_disp(res['off']), 1) if res else None, frame=fr))
     return out
@@ -358,6 +425,8 @@ class CameraGuard:
 
     def __init__(self, profile: Profile, size=(640, 360)):
         self.p = profile
+        self.move_px = max(6.0,float(profile.camera_tolerance))
+        self.MOVE_PX = self.move_px
         self.size = None
         self.ref = None
         self.ref_t = None
@@ -387,7 +456,7 @@ class CameraGuard:
     def _mask(self, w, h):
         k = self.K
         m = np.ones((h // k, w // k), bool)
-        x0, y0, x1, y1 = self.p.track_rect
+        x0, y0, x1, y1 = self.p.track_bounds()
         m[max(0, (min(y0, y1) - 20) // k):(max(y0, y1) + 20) // k + 1, max(0, (min(x0, x1) - 20) // k):(max(x0, x1) + 20) // k + 1] = False
         m[:40 // k] = False      # 上方（多數攝影機的時間字幕在這裡）
         a, b, c, d = osd_box(self.p, k)
@@ -420,7 +489,7 @@ class CameraGuard:
         F = geo_features(frame_bgr, self.p)
         if self.recover is not None:                # 「無法確認位置」之後：等到能和監測站基準確認為止
             res, _ = best_anchor(F, self.anchors, self.p)
-            v = geo_verdict(res)
+            v = geo_verdict(res,tolerance=self.move_px)
             if v == 'same':
                 self.recover['until'] = t
                 self.recover = None
@@ -435,9 +504,9 @@ class CameraGuard:
                 self.geo_t0 = t
             if self.has_anchors:
                 res, _ = best_anchor(F, self.anchors, self.p)
-                v = geo_verdict(res)
+                v = geo_verdict(res,tolerance=self.move_px)
                 self.geo_n, self.geo_off = (res['n'], res['off']) if res else (0, None)
-                if v == 'moved' or (v == 'uncertain' and t - self.geo_t0 >= 10.0):
+                if (res is not None and geo_disp(res['off']) >= self.move_px) or (v == 'uncertain' and t - self.geo_t0 >= 10.0):
                     # 和監測站儲存時的位置不同／無法確認：記下來（之後的列車標需確認，#88）
                     return (self.geo_t0, file, pos, 'profile', v)
                 if v != 'same':
@@ -470,7 +539,7 @@ class CameraGuard:
             total = res['off']
             self.home, self.home_off = F, total
         self.geo_ok_t, self.geo_off, self.geo_n = t, total, res['n']
-        if geo_disp(total) >= GEO_MOVE:            # 連續兩次（間隔 GEO_STEP 秒）都超過才確認
+        if geo_disp(total) >= self.move_px:            # 連續兩次（間隔 GEO_STEP 秒）都超過才確認
             if self.geo_sus is None:
                 self.geo_sus = (t, file, pos)
             elif t - self.geo_sus[0] >= GEO_STEP * 0.9:
@@ -560,7 +629,7 @@ class CameraGuard:
         if res is None:
             res, _ = best_anchor(F, self.anchors, self.p)
             total = res['off'] if res else None
-        v = geo_verdict(res, total)
+        v = geo_verdict(res,total,tolerance=self.move_px)
         self.last_result = (round(geo_disp(total), 1) if total is not None else 0.0, res['n'] if res else 0)
         if v == 'same':
             self.home, self.home_off, self.geo_off = F, total, total
@@ -577,25 +646,56 @@ class Detector:
     HEAD_SEC = 60.0        # 方向判斷：保留事件開頭幾秒的逐格資料
     TAIL_SEC = 60.0        #           與最後幾秒（列車停很久也不會吃光記憶體，車頭／車尾的證據都在）
 
-    def __init__(self, profile: Profile, crop):
+    def __init__(self, profile: Profile, crop, occluded: bool = False, guard: bool = True):
+        """occluded：遮擋判讀（參考線被隔音罩等擋住一部分時，用看得到的部分判讀，#115；process 會兩種同時跑、自動選）。
+        guard：要不要確認攝影機位置（同時跑兩種時只有一般判讀確認，省時間）"""
         self.p = profile
+        self.occluded = bool(occluded)
+        self.use_guard = bool(guard)
         self.cx0, self.cy0, cx1, cy1 = crop
         h, w = cy1 - self.cy0, cx1 - self.cx0
         m = np.zeros((h, w), np.uint8)
         (xa, ya), (xb, yb) = profile.ref_line
         cv2.line(m, (int(xa - self.cx0), int(ya - self.cy0)), (int(xb - self.cx0), int(yb - self.cy0)), 255,
                  max(1, int(profile.ref_width)))
+        if self.occluded and int(profile.ref_height or 0) > 0:
+            base_mask=m.copy()
+            for dy in range(1,min(50,int(profile.ref_height))+1):
+                m[:-dy] |= base_mask[dy:]
+        tm = np.zeros_like(m)
+        cv2.fillConvexPoly(tm, np.rint(profile.track_points()-[self.cx0,self.cy0]).astype(np.int32),255)
+        m[tm == 0] = 0
+        if not m.any():
+            raise ValueError('參考線未穿過軌道範圍，請重新繪製')
         self.ref_mask = m > 0
+        self.track_mask = tm > 0
+        self.track_maps = None
+        if not profile.track_is_rect():
+            # 旋轉或任意四邊形（#114）：用透視轉換把四邊形拉直成長條，沿軌道方向一欄一欄統計
+            tw, th, _, _ = profile.track_axes()
+            W, H = max(1, int(round(tw))), max(1, int(round(th)))
+            src = np.float32([[0, 0], [W, 0], [W, H], [0, H]])
+            dst = (profile.track_points() - np.float32([self.cx0, self.cy0])).astype(np.float32)
+            M = cv2.getPerspectiveTransform(src, dst)
+            xx, yy = np.meshgrid(np.arange(W, dtype=np.float32) + 0.5, np.arange(H, dtype=np.float32) + 0.5)
+            pts = cv2.perspectiveTransform(np.stack([xx, yy], -1).reshape(-1, 1, 2), M).reshape(H, W, 2)
+            self.track_maps = (np.ascontiguousarray(pts[..., 0]), np.ascontiguousarray(pts[..., 1]))
         self.light_since = None   # 白天「只是光線變化」從什麼時候開始
-        x0, y0, x1, y1 = profile.track_rect
+        x0, y0, x1, y1 = profile.track_bounds()
         self.tr = (int(min(x0, x1) - self.cx0), int(min(y0, y1) - self.cy0),
                    int(max(x0, x1) - self.cx0), int(max(y0, y1) - self.cy0))
         self.horiz = profile.horizontal()
         # 紋理比對用：參考線「沿軌道方向」前後各加寬 10 像素的帶狀區域
         # （左右走向往左右加寬；上下走向往上下加寬。v1.0.8 以前一律往左右，上下走向時只把線拉長，修正清單 #51）
-        self.band = cv2.dilate(m, np.ones((1, 21) if self.horiz else (21, 1), np.uint8)) > 0
+        self.band = (cv2.dilate(m, np.ones((21, 21) if self.track_maps is not None else ((1, 21) if self.horiz else (21, 1)), np.uint8)) > 0) & self.track_mask
         rp = profile.ref_pos() - (min(x0, x1) if self.horiz else min(y0, y1))
         self.ref_idx = int(round(rp))
+        if self.track_maps is not None:
+            rm=cv2.remap(m,*self.track_maps,cv2.INTER_NEAREST)
+            ry,rx=np.nonzero(rm)
+            if not len(rx):
+                raise ValueError('參考線未穿過軌道範圍')
+            self.ref_idx=int(round(np.median(rx if self.horiz else ry)))
         self.bg = None
         self.hist = []          # 最近幾秒的 (t, 覆蓋向量)
         self.cur = None         # 進行中的事件
@@ -632,21 +732,35 @@ class Detector:
             return
         if self._camera_check(t_abs, g, gain, file, pos):
             return
-        diff = np.abs(g - self.bg)
+        if self.p.passing_only:
+            # Remove broad illumination changes while retaining train edges/windows.
+            hp=g-cv2.GaussianBlur(g,(0,0),4)
+            bp=self.bg-cv2.GaussianBlur(self.bg,(0,0),4)
+            diff=2.0*np.abs(hp-bp)
+        else:
+            diff = np.abs(g - self.bg)
+        ref_motion=0.0
         if self.prev is not None and self.prev.shape == g.shape:
             fd = np.abs(g - self.prev)
+            ref_motion=float(fd[self.ref_mask].mean())
             tx0, ty0, tx1, ty1 = self.tr
             # 有沒有在動：參考線上的平均變化，或軌道範圍內明顯變化的像素比例（車身顏色均勻時參考線上看不出在動）
             moving = (float(fd[self.ref_mask].mean()) > self.p.static_motion
-                      or float((fd[ty0:ty1, tx0:tx1] > 10).mean()) > 0.004)
+                      or float((fd[self.track_mask] > 10).mean()) > 0.004)
         else:
             moving = True
         self.prev = g
-        score = float(diff[self.ref_mask].mean()) if self.ref_mask.any() else 0.0
+        values=diff[self.ref_mask]
+        if self.occluded and values.size:
+            # 遮擋判讀：列車只佔參考線看得到的那一段，固定的牆不可以把平均稀釋掉
+            n=max(1,int(values.size*0.3))
+            score=float(np.partition(values,values.size-n)[-n:].mean())
+        else:
+            score=float(values.mean()) if values.size else 0.0
         tx0, ty0, tx1, ty1 = self.tr
-        tr = diff[ty0:ty1, tx0:tx1] > self.p.pixel_diff
+        tr = (cv2.remap(diff,*self.track_maps,cv2.INTER_LINEAR) if self.track_maps is not None else diff[ty0:ty1, tx0:tx1]) > self.p.pixel_diff
         prof = tr.mean(axis=0) if self.horiz else tr.mean(axis=1)   # 沿軌道方向每一欄（列）的變化比例
-        active = prof > 0.3
+        active = prof > (0.12 if self.occluded else 0.3)
         cov = float(active.mean()) if active.size else 0.0
         k = self.ref_idx
         lft, rgt = active[:max(1, k - 3)], active[k + 3:]
@@ -665,7 +779,7 @@ class Detector:
         # 被當成「陽光」而不算佔用，還把列車學成背景，列車只剩 0.1～0.3 秒（被排除）或整筆漏掉。
         # 但紋理幾乎完全一樣（相似度 ≥ light_cross_ncc）時，即使大範圍變亮變暗，仍是光線變化（整片雲影、假影片的陽光約 0.99；
         # 實測被遮住一部分的列車最高 0.73）
-        crossing = cov >= self.p.light_cross_cov and both >= self.p.min_both
+        crossing = cov >= self.p.light_cross_cov and (both >= self.p.min_both or self.occluded)
         if sat >= self.p.day_saturation and score > self.p.off_level:
             u = g[self.band]; v = self.bg[self.band]
             u = u - u.mean(); v = v - v.mean()
@@ -721,10 +835,22 @@ class Detector:
                     self.pending_close = t_abs
                 if t_abs - c['end'] > max(self.p.merge_gap, self.SIDE_WINDOW):
                     self._close()
+        if self.p.passing_only and self.cur is not None:
+            mt=self.cur.setdefault('ref_motion_tail',[])
+            mt.append((t_abs,ref_motion,file,pos))
+            while mt and t_abs-mt[0][0]>20: mt.pop(0)
         # 背景更新：沒有事件時一律學習（畫面某處永久改變時才不會一直卡在「有點不一樣」）；
         # 事件進行中（含列車停住的時候）完全凍結，停著的列車不會被學成背景。光線變化交給亮度修正（_exposure）處理。
         if self.cur is not None:
+            if self.p.passing_only:
+                elapsed=min(1.0,max(0.01,t_abs-getattr(self,'_passing_bg_t',t_abs-0.2)))
+                a=1-math.exp(-elapsed/180.0)
+                self.bg=self.bg*(1-a)+(g*gain)*a
+                if self.small is not None and self.bg_small is not None:
+                    self.bg_small=self.bg_small*(1-a)+self.small*a
+                self._passing_bg_t=t_abs
             return
+        self._passing_bg_t=t_abs
         if self.light_since is not None and t_abs - self.light_since >= 1.0:
             # 光線變化持續 1 秒：直接把現在的畫面當新背景（不然要好幾分鐘才學得完，期間來的列車會判不準）
             self.bg = g * gain
@@ -752,10 +878,16 @@ class Detector:
         突然被碰歪（moved）：進行中的那一筆在改變的那一刻結束（車尾未確認；改變那一刻才開始的，就不是列車），
         然後用接下來 WARM 秒的畫面重新建立列車背景，背景建好後把這段畫面補判讀（不會漏掉這段時間的列車）。
         回傳 True＝這一格不判讀（開始重新建立背景）"""
+        if not self.use_guard:
+            return False
         hit = self.guard.check(t_abs, self._frame, self._sat, self.cur is not None, file, pos)
         if not hit:
             return False
         t0, f0, p0, kind, result = hit
+        if result != 'moved':
+            self.guard.notes.append(dict(file=file,t=t_abs,text='位置比對不足，未量到明確大幅偏移；繼續列車判讀'))
+            self.guard.rebase()
+            return False
         g_ = self.guard
         ce = dict(t=t0, file=f0, pos=p0, kind=kind, result=result, now=t_abs,
                   disp=round(geo_disp(g_.geo_off), 1) if g_.geo_off is not None else None, n=g_.geo_n)
@@ -847,7 +979,7 @@ class Detector:
             return 1.0
         if self.out_mask is None or self.out_mask.shape != sm.shape:
             m = np.ones(sm.shape, bool)
-            x0, y0, x1, y1 = self.p.track_rect
+            x0, y0, x1, y1 = self.p.track_bounds()
             m[max(0, (min(y0, y1) - 20) // k):(max(y0, y1) + 20) // k + 1, max(0, (min(x0, x1) - 20) // k):(max(x0, x1) + 20) // k + 1] = False
             m[:40 // k] = False
             a, b, c, d = osd_box(self.p, k)
@@ -948,6 +1080,22 @@ class Detector:
                     e_shift = c['end'] - t
                     c['end'], c['end_file'], c['end_pos'] = t, f, pos
                 break
+        if self.p.passing_only:
+            # A static residual may remain after a moving train has cleared the line.
+            # Only trim a completed short-pass event after at least 2 s without local motion.
+            evidence=[];run=[]
+            for x in c.get('ref_motion_tail',[]):
+                if c['start']<x[0]<=c['end'] and x[1]>=1.0:
+                    if run and x[0]-run[-1][0]>.35: run=[]
+                    run.append(x)
+                    if len(run)>=2: evidence.append(x)
+                else:
+                    run=[]
+            if evidence:
+                t,v,f,pos=evidence[-1]
+                if c['end']-t>=2.0 and t-c['start']>=self.p.min_duration:
+                    e_shift+=c['end']-t
+                    c['end'],c['end_file'],c['end_pos']=t,f,pos
         return s_shift, e_shift
 
     def _close(self):
@@ -968,10 +1116,8 @@ class Detector:
             sign, agree = 0, False
         if sign == 0:
             direction = '無法判定'
-        elif self.horiz:
-            direction = '往右' if sign > 0 else '往左'
         else:
-            direction = '往下' if sign > 0 else '往上'
+            direction = self.p.direction_label(sign)
         night = float(np.median(c['sat'])) < 12
         dur = c['end'] - c['start']
         ev = dict(first_change=first_change, start=c['start'], end=c['end'], start_file=c['start_file'], end_file=c['end_file'],
@@ -994,7 +1140,7 @@ class Detector:
         elif c['coverage'] < self.p.min_coverage:
             ev['valid'] = False
             reasons.append('軌道範圍內變化範圍太小（%.0f%%，可能是汽車、行人或樹葉）' % (c['coverage'] * 100))
-        elif c.get('both', 0.0) < self.p.min_both:
+        elif c.get('both', 0.0) < self.p.min_both and not self.occluded:
             ev['valid'] = False
             reasons.append('只有參考線一側有變化，沒有東西橫跨參考線（可能是車燈照射或路上的車）')
         if c.get('incomplete'):
@@ -1008,6 +1154,11 @@ class Detector:
             reasons.insert(0, '攝影機位置在 %s 改變（可能被碰到或轉動），這一筆是畫面改變造成的，不是列車'
                            % fmt_time(c['camera_t']))
         if ev['valid']:
+            if self.p.passing_only and dur>30:
+                ev['end_known']=False
+                ev['need_check']=True
+                reasons.append('短暫通過模式的佔用超過 30 秒，車尾時間需核對；可能有停車或畫面異常，長時間停車請改用一般模式')
+                items.append('短暫通過模式超過 30 秒（車尾未確認）')
             if not agree:
                 ev['need_check'] = True
                 reasons.append('方向不確定'); items.append('方向不確定')
@@ -1102,8 +1253,9 @@ def _ncc(u, v):
 
 def work_crop(profile: Profile, w: int, h: int, pad: int = 8):
     """只處理參考線與軌道範圍的外框，速度快很多"""
-    xs = [profile.ref_line[0][0], profile.ref_line[1][0], profile.track_rect[0], profile.track_rect[2]]
-    ys = [profile.ref_line[0][1], profile.ref_line[1][1], profile.track_rect[1], profile.track_rect[3]]
+    bx0, by0, bx1, by1 = profile.track_bounds()
+    xs = [profile.ref_line[0][0], profile.ref_line[1][0], bx0, bx1]
+    ys = [profile.ref_line[0][1], profile.ref_line[1][1], by0, by1]
     x0 = max(0, int(min(xs)) - pad); x1 = min(w, int(max(xs)) + pad + 1)
     y0 = max(0, int(min(ys)) - pad); y1 = min(h, int(max(ys)) + pad + 1)
     return x0, y0, x1, y1
@@ -1111,8 +1263,8 @@ def work_crop(profile: Profile, w: int, h: int, pad: int = 8):
 
 def draw_overlay(frame, profile: Profile, color_ref=(0, 0, 255), color_track=(0, 200, 255)):
     f = frame.copy()
-    x0, y0, x1, y1 = [int(v) for v in profile.track_rect]
-    cv2.rectangle(f, (x0, y0), (x1, y1), color_track, 1)
+    x0, y0, x1, y1 = profile.track_bounds()
+    cv2.polylines(f, [np.rint(profile.track_points()).astype(np.int32)], True, color_track, 1)
     (xa, ya), (xb, yb) = profile.ref_line
     cv2.line(f, (int(xa), int(ya)), (int(xb), int(yb)), color_ref, 2)
     return f
@@ -1123,7 +1275,7 @@ def process(files: List[str], bases: List[float], profile: Profile,
     """依序處理多個檔案（同一攝影機）。bases：每個檔案「影片內 0 秒」對應的畫面時間（epoch 秒，由 osd.calibrate 算出）。
     回傳事件 list（dict）。info（dict）：攝影機位置有問題時填入 info['camera']（第一次）與 info['camera_events']（全部），
     影片讀取出錯時填入 info['error']／info['errors']；都**繼續判讀**，之後的列車標需確認（#88）"""
-    det = None
+    det = det2 = None
     durs = []
     for f in files:
         vi = video_info(f)
@@ -1147,6 +1299,9 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 batch_t0 = base
                 det.bg, det.bg_note = initial_background(f, crop, profile)   # 開頭若剛好有列車經過，不會被當成背景
                 det.bg_note_file = f
+                # 參考線被隔音罩等擋住一部分時（#115）：同時用「遮擋判讀」跑一份，最後自動選（choose_occlusion）
+                det2 = Detector(profile, crop, occluded=True, guard=False)
+                det2.bg, det2.bg_note, det2.bg_note_file = det.bg.copy(), det.bg_note, f
             elif prev_end is not None and base < prev_end - OVERLAP_SEC:
                 # 實際讀完上一支後，下一支的時間比它還早：時間倒退或重疊，不可以把時間往回餵給判讀（#69）
                 raise TimeOrderError('依實際影片時間確認，「%s」的開始時間 %s 比上一支「%s」實際的結尾 %s 還早 %.1f 秒'
@@ -1157,9 +1312,10 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 # 錄影中斷（缺檔）：前後不是連續畫面。進行中的那一筆在中斷處結束（車尾未確認），背景重新建立（#49）
                 gap = base - prev_end
                 det.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
+                det2.finish('gap', '（下一支影片 %s 才開始，中間缺 %s）' % (fmt_time(base), fmt_span(gap)))
                 # 攝影機位置：中斷前後確認一致才算沒問題；不一致或無法確認 → 記下來、繼續判讀，之後的列車標需確認（#76、#88）
                 res = det.guard.gap_check(f)
-                if res != 'same':
+                if res == 'moved' and (det.guard.last_result or (0,0))[0] >= profile.camera_tolerance:
                     disp, n = det.guard.last_result or (0.0, 0)
                     ce = dict(t=base, file=f, pos=0.0, kind='gap', result=res, prev_end=prev_end, disp=disp, n=n, now=base)
                     det.camera_events.append(ce)
@@ -1167,7 +1323,10 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 bg, note = initial_background(f, crop, profile)
                 det.restart(bg, note)
                 det.bg_note_file = f
+                det2.restart(bg.copy(), note)
+                det2.bg_note_file = f
             k = 0
+            analyzed_pos = -1e9
             sat = 50.0
             while True:
                 ok, fr = cap.read()
@@ -1177,18 +1336,27 @@ def process(files: List[str], bases: List[float], profile: Profile,
                 if pos <= last_pos and k > 0:   # 少數格式讀不到時間 → 用上一格推算
                     pos = last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15)
                 last_pos = pos
+                if profile.passing_only and pos-analyzed_pos < 0.19:
+                    k+=1
+                    if progress and k%150==0:
+                        progress(min(1.0,(done+pos)/total),'%s（%d/%d）'%(os.path.basename(f),fi+1,len(files)))
+                    if cancel and k%30==0 and cancel():
+                        return _wrap_up(det,_both(det,det2,'cancel',info),batch_t0,info,errors)
+                    continue
+                analyzed_pos=pos
                 x0, y0, x1, y1 = crop
                 sub = fr[y0:y1, x0:x1]
                 gray = cv2.GaussianBlur(cv2.cvtColor(sub, cv2.COLOR_BGR2GRAY), (5, 5), 0)
                 if k % 15 == 0:
                     sat = float(cv2.cvtColor(sub, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
                 det.feed(base + pos, gray, sat, f, pos, fr)
+                det2.feed(base + pos, gray, sat, f, pos, fr)
                 k += 1
                 if progress and k % 150 == 0:
                     progress(min(1.0, (done + pos) / total), '%s（%d/%d）' % (os.path.basename(f), fi + 1, len(files)))
                 if cancel and k % 30 == 0 and cancel():
                     cap.release()
-                    return _wrap_up(det, det.finish('cancel'), batch_t0, info, errors)
+                    return _wrap_up(det, _both(det, det2, 'cancel', info), batch_t0, info, errors)
             prev_end = base + last_pos + 1.0 / (cap.get(cv2.CAP_PROP_FPS) or 15) if k else base
         except TimeOrderError:
             raise
@@ -1196,10 +1364,11 @@ def process(files: List[str], bases: List[float], profile: Profile,
             # 判讀途中出錯（例如影片損壞）：跳過這支影片剩下的部分，繼續下一支；已完成的列車照常輸出（#87、#88）
             errors.append(dict(file=f, t=base + last_pos, pos=last_pos, msg='%s: %s' % (type(ex).__name__, ex)))
             if det is not None:
-                try:
-                    det.finish('error', '%s，影片 %s' % (type(ex).__name__, os.path.basename(f)))
-                except Exception:
-                    pass
+                for d_ in (det, det2):
+                    try:
+                        d_.finish('error', '%s，影片 %s' % (type(ex).__name__, os.path.basename(f)))
+                    except Exception:
+                        pass
                 prev_end = base + last_pos       # 下一支影片會當成錄影中斷（背景重建、位置重新比對）
         finally:
             if cap is not None:
@@ -1209,7 +1378,36 @@ def process(files: List[str], bases: List[float], profile: Profile,
         if errors:
             raise RuntimeError('沒有任何一支影片可以判讀：%s（%s）' % (os.path.basename(errors[0]['file']), errors[0]['msg']))
         return []
-    return _wrap_up(det, det.finish('video_end'), batch_t0, info, errors)
+    return _wrap_up(det, _both(det, det2, 'video_end', info), batch_t0, info, errors)
+
+
+OCCL_SHARE = 0.5     # 遮擋判讀找到的列車，一般判讀也找到的比例低於這個值 → 參考線被擋住一部分，改用遮擋判讀（#115）
+OCCL_MIN = 3         # 遮擋判讀至少要多找到幾筆才換
+
+
+def _both(det, det2, why, info):
+    """兩種判讀都結束，選一份（#115）"""
+    a = det.finish(why)
+    b = det2.finish(why)
+    use, stat = choose_occlusion(a, b)
+    if info is not None:
+        info['occlusion'] = stat
+    if not use:
+        return a
+    return b                      # 改用遮擋判讀的說明寫在完成視窗（備註不加，免得每筆都很長）
+
+
+def choose_occlusion(normal, occl):
+    """一般判讀與遮擋判讀的結果要用哪一份（#115，程式自動判斷，使用者不用勾選）。
+    參考線沒被擋住時，列車兩側都看得到，遮擋判讀找到的列車一般判讀幾乎也都找到；
+    參考線被擋住一部分時，大部分列車在一般判讀只有一側有變化而被排除 → 遮擋判讀找到的列車大多一般判讀沒找到。
+    回傳 (要不要用遮擋判讀, 統計)"""
+    nv = [e for e in normal if e.get('valid')]
+    ov = [e for e in occl if e.get('valid')]
+    both = sum(1 for o in ov if any(n['start'] < o['end'] + 1 and o['start'] < n['end'] + 1 for n in nv))
+    share = both / len(ov) if ov else 1.0
+    use = len(ov) - len(nv) >= OCCL_MIN and share < OCCL_SHARE
+    return use, dict(used=bool(use), normal=len(nv), occluded=len(ov), share=round(share, 3))
 
 
 def _wrap_up(det, evs, batch_t0, info, errors):

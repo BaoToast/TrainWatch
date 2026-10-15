@@ -515,7 +515,7 @@ class TestRound4(unittest.TestCase):
 
     def run_info(self, files, bases, prof=None):
         info = {}
-        evs = core.number_events(core.process(files, bases, prof or core.Profile(), info=info))
+        evs = core.number_events(core.process(files, bases, prof or core.Profile(camera_tolerance=6.0), info=info))
         return evs, info
 
     def test71a_idle_camera_moved_stops(self):
@@ -744,7 +744,7 @@ class TestRound8(unittest.TestCase):
         c.set(cv2.CAP_PROP_POS_MSEC, at * 1000)
         ok, fr = c.read()
         c.release()
-        p = core.Profile()
+        p = core.Profile(camera_tolerance=6.0)
         p.camera_anchors = [core.make_anchor(fr)]
         return p
 
@@ -864,7 +864,7 @@ class TestRound8(unittest.TestCase):
         finally:
             core.GEO_STALE = old
         ces = info.get('camera_events', [])
-        self.assertTrue(any(x['kind'] == 'uncertain' and x.get('until') for x in ces), ces)
+        self.assertFalse(any(x['result'] == 'uncertain' for x in ces), ces)  # v1.0.19: 比不起來不再污染列車事件
         v = [e for e in self.valid(evs) if abs(e['start'] - 120) < 1]
         self.assertEqual(len(v), 1, [(e['start'], e['valid'], e['reason'][:50]) for e in evs])
         self.assertNotIn('攝影機', v[0]['reason'])
@@ -934,7 +934,7 @@ class TestRound9(unittest.TestCase):
     def test89a_save_same_place(self):
         """#89 監測站基準 A、目前畫面仍是 A、參考線沒改 → 可以儲存；不多加一張幾乎一樣的基準"""
         A, B = self.ab()
-        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        p = core.Profile(camera_tolerance=6.0); p.camera_anchors = [core.make_anchor(A)]
         r = core.plan_anchor_save(p, A, geom_changed=False)
         self.assertEqual(r['verdict'], 'same')
         self.assertEqual(len(r['anchors']), 1)
@@ -942,7 +942,7 @@ class TestRound9(unittest.TestCase):
     def test89b_save_moved_not_polluted(self):
         """#89 基準 A、攝影機已移到 B、參考線沒改就按儲存 → 回報 moved，B 不可以變成合法基準"""
         A, B = self.ab()
-        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        p = core.Profile(camera_tolerance=6.0); p.camera_anchors = [core.make_anchor(A)]
         r = core.plan_anchor_save(p, B, geom_changed=False)
         self.assertEqual(r['verdict'], 'moved')
         self.assertEqual(len(r['anchors']), 1)                 # 只有原本的 A
@@ -961,7 +961,7 @@ class TestRound9(unittest.TestCase):
     def test89c_redrawn_lines_new_anchor(self):
         """#89 攝影機移到 B，使用者重畫參考線後儲存 → 建立 B 的基準，和 B 位置不同的舊基準 A 移除"""
         A, B = self.ab()
-        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        p = core.Profile(camera_tolerance=6.0); p.camera_anchors = [core.make_anchor(A)]
         r = core.plan_anchor_save(p, B, geom_changed=True)
         self.assertEqual(r['verdict'], 'new')
         self.assertEqual(len(r['anchors']), 1)
@@ -973,7 +973,7 @@ class TestRound9(unittest.TestCase):
         d, a, _ = self.scene('a.avi', 5, texture=3000)
         A = self.frame(a)
         noise = np.random.default_rng(3).integers(0, 255, A.shape, np.uint8)
-        p = core.Profile(); p.camera_anchors = [core.make_anchor(A)]
+        p = core.Profile(camera_tolerance=6.0); p.camera_anchors = [core.make_anchor(A)]
         r = core.plan_anchor_save(p, noise, geom_changed=False)
         self.assertEqual(r['verdict'], 'uncertain')
         self.assertEqual(len(r['anchors']), 1)
@@ -985,7 +985,7 @@ class TestRound9(unittest.TestCase):
         d, a, _ = self.scene('a.avi', 5, texture=3000)
         d, n, _ = self.scene('n.avi', 5, texture=3000, ir_at=0)
         A, N = self.frame(a), self.frame(n)
-        p = core.Profile(); p.camera_anchors = [core.make_anchor(A), core.make_anchor(N, note='夜間')]
+        p = core.Profile(camera_tolerance=6.0); p.camera_anchors = [core.make_anchor(A), core.make_anchor(N, note='夜間')]
         for _ in range(10):
             p.camera_anchors = core.add_anchor(p.camera_anchors, core.make_anchor(A), p)
         self.assertLessEqual(len(p.camera_anchors), 2)
@@ -1513,7 +1513,7 @@ class TestRound10b(unittest.TestCase):
     """#104 換比較畫面時的量測誤差一直累積，誤報攝影機慢慢偏移"""
     def run_guard(self, steps):
         """steps：每次比對（每 GEO_STEP 秒）量到相對目前比較畫面的位移（像素，整體平移）與符合的點數"""
-        p = core.Profile()
+        p = core.Profile(camera_tolerance=6.0)
         g = core.CameraGuard(p)
         k = len(core.geo_points(p))
         g.home, g.home_off, g.geo_ok_t, g.geo_off = 'home', np.zeros((k, 2), np.float32), 0.0, np.zeros((k, 2), np.float32)
